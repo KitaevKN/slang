@@ -288,16 +288,13 @@ Under LRM rules, this results in a compilation error because inside a procedural
 is not constant and therefore the longest static prefix of the assignment is just `foo`, and so all elements
 are assumed assigned by the initial block. Most tools, slang included, implement an extension to attempt to
 unroll all procedural for loops in order to extend the longest static prefix of assignments within those loops,
-making the above example compile successfully. Such unrolling can be disabled with the `--strict-driver-checking`
-command line flag.
+making the above example compile successfully. Such unrolling can be disabled by setting
+--max-loop-analysis-steps to zero.
 
 The limitations of this feature are as follows:
 - Only for loops are supported -- other kinds of loops are not.
 - The for loop must declare its iteration variables and must provide stop and iteration expressions.
-- The number of iterations of all for loops in a block must be less than the limit given by `--max-constexpr-steps`
-- Only assignment statements are supported -- output args from subroutines are not taken into account.
-- Conditional statements inside of for loops that depend on the iteration variable will work as expected.
-- All other forms of flow control inside each for loop (including break / continue) are ignored.
+- The number of iterations of all for loops in a block must be less than the limit given by `--max-loop-analysis-steps`
 
 @section slang-pragmas Pragmas
 
@@ -347,5 +344,32 @@ module m;
 endmodule
 @endcode
 
+@section comment-directives Comment Directives
+
+slang supports controlling warnings via comment directives in addition to the pragmas
+mentioned above. Example:
+
+@code{.sv}
+module m;
+    ; // warn
+
+    // slang lint_off empty-member
+    ; // hidden
+    // slang lint_save
+    /* slang lint_on empty-member */
+    ; // warn
+    /* slang lint_restore */
+    ; // hidden
+endmodule
+@endcode
+
+The possible comment directives are:
+-   `lint_off` -- Turn off the specified warning
+-   `lint_on` -- Turn on the specified warning
+-   `lint_save` -- Push the current warning state to a stack, just like `` `pragma diagnostic push ``
+-   `lint_restore` -- Pop the warning state stack, just like `` `pragma diagnostic pop ``
+
+slang can also be configured to skip over text enclosed in legacy style "translate_off" comment regions.
+See the `--translate-off-format` command line argument description for more details.
 
 */

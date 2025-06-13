@@ -98,7 +98,8 @@ void Preprocessor::pushSource(std::string_view source, std::string_view name) {
 void Preprocessor::pushSource(SourceBuffer buffer) {
     SLANG_ASSERT(buffer.id);
 
-    lexerStack.emplace_back(std::make_unique<Lexer>(buffer, alloc, diagnostics, lexerOptions));
+    lexerStack.emplace_back(
+        std::make_unique<Lexer>(buffer, alloc, diagnostics, sourceManager, lexerOptions));
 }
 
 void Preprocessor::popSource() {
@@ -190,6 +191,7 @@ void Preprocessor::resetAllDirectives() {
     activeTimeScale = std::nullopt;
     defaultNetType = TokenKind::WireKeyword;
     unconnectedDrive = TokenKind::Unknown;
+    cellDefine = false;
     resetProtectState();
 }
 
@@ -208,6 +210,10 @@ std::vector<const DefineDirectiveSyntax*> Preprocessor::getDefinedMacros() const
         return a->name.valueText() < b->name.valueText();
     });
     return results;
+}
+
+std::vector<IncludeMetadata> Preprocessor::getIncludeDirectives() const {
+    return includeDirectives;
 }
 
 Token Preprocessor::next() {
@@ -355,6 +361,12 @@ Token Preprocessor::handleDirectives(Token token) {
                     case SyntaxKind::NoUnconnectedDriveDirective:
                         trivia.push_back(handleNoUnconnectedDriveDirective(token));
                         break;
+                    case SyntaxKind::CellDefineDirective:
+                        trivia.push_back(handleCellDefineDirective(token));
+                        break;
+                    case SyntaxKind::EndCellDefineDirective:
+                        trivia.push_back(handleEndCellDefineDirective(token));
+                        break;
                     case SyntaxKind::DefaultDecayTimeDirective:
                         trivia.push_back(handleDefaultDecayTimeDirective(token));
                         break;
@@ -368,8 +380,6 @@ Token Preprocessor::handleDirectives(Token token) {
                             trivia.push_back(skipped);
                         break;
                     }
-                    case SyntaxKind::CellDefineDirective:
-                    case SyntaxKind::EndCellDefineDirective:
                     case SyntaxKind::DelayModeDistributedDirective:
                     case SyntaxKind::DelayModePathDirective:
                     case SyntaxKind::DelayModeUnitDirective:
@@ -438,9 +448,10 @@ Token Preprocessor::nextRaw() {
     // that one, but we do want to merge its trivia with whatever comes next.
     SmallVector<Trivia, 8> trivia;
     auto appendTrivia = [&trivia, this](Token token) {
+        trivia.append_range(token.trivia());
         SourceLocation loc = token.location();
-        for (const auto& t : token.trivia())
-            trivia.push_back(t.withLocation(alloc, loc));
+        if (!token.trivia().empty())
+            trivia.back() = trivia.back().withLocation(alloc, loc);
     };
 
     appendTrivia(token);
@@ -526,6 +537,7 @@ Trivia Preprocessor::handleIncludeDirective(Token directive) {
 
     // path should be at least three chars: "a" or <a>
     std::string_view path = fileName.valueText();
+    auto syntax = alloc.emplace<IncludeDirectiveSyntax>(directive, fileName);
     if (path.length() < 3) {
         if (!fileName.isMissing())
             addDiag(diag::ExpectedIncludeFileName, fileName.range());
@@ -547,10 +559,16 @@ Trivia Preprocessor::handleIncludeDirective(Token directive) {
         else if (includeOnceHeaders.find(buffer->data.data()) == includeOnceHeaders.end()) {
             includeDepth++;
             pushSource(*buffer);
+
+            includeDirectives.push_back(IncludeMetadata{
+                .syntax = syntax,
+                .path = path,
+                .buffer = *buffer,
+                .isSystem = isSystem,
+            });
         }
     }
 
-    auto syntax = alloc.emplace<IncludeDirectiveSyntax>(directive, fileName);
     return Trivia(TriviaKind::Directive, syntax);
 }
 
@@ -1086,6 +1104,16 @@ Trivia Preprocessor::handleUnconnectedDriveDirective(Token directive) {
 Trivia Preprocessor::handleNoUnconnectedDriveDirective(Token directive) {
     checkOutsideDesignElement(directive);
     unconnectedDrive = TokenKind::Unknown;
+    return createSimpleDirective(directive);
+}
+
+Trivia Preprocessor::handleCellDefineDirective(Token directive) {
+    cellDefine = true;
+    return createSimpleDirective(directive);
+}
+
+Trivia Preprocessor::handleEndCellDefineDirective(Token directive) {
+    cellDefine = false;
     return createSimpleDirective(directive);
 }
 

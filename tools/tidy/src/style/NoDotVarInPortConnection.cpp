@@ -13,20 +13,19 @@ using namespace slang::syntax;
 
 namespace no_dot_var_in_port_connection {
 
-struct PortConnectionVisitor : public SyntaxVisitor<PortConnectionVisitor> {
+struct PortConnectionVisitor : SyntaxVisitor<PortConnectionVisitor> {
     void handle(const NamedPortConnectionSyntax& port) {
-        if (!port.expr)
+        if (!port.openParen)
             foundPorts.push_back(&port);
     }
 
-public:
     std::vector<const NamedPortConnectionSyntax*> foundPorts;
 };
 
-struct MainVisitor : public TidyVisitor, ASTVisitor<MainVisitor, true, true> {
+struct MainVisitor : TidyVisitor, ASTVisitor<MainVisitor, true, true> {
     explicit MainVisitor(Diagnostics& diagnostics) : TidyVisitor(diagnostics) {}
 
-    void handle(const InstanceBodySymbol& symbol) {
+    void handle(const InstanceBodySymbol& symbol) const {
         NEEDS_SKIP_SYMBOL(symbol)
         if (!symbol.getSyntax())
             return;
@@ -43,11 +42,13 @@ struct MainVisitor : public TidyVisitor, ASTVisitor<MainVisitor, true, true> {
 
 using namespace no_dot_var_in_port_connection;
 
-class NoDotVarInPortConnection : public TidyCheck {
+class NoDotVarInPortConnection final : public TidyCheck {
 public:
-    [[maybe_unused]] explicit NoDotVarInPortConnection(TidyKind kind) : TidyCheck(kind) {}
+    [[maybe_unused]] explicit NoDotVarInPortConnection(
+        const TidyKind kind, std::optional<slang::DiagnosticSeverity> severity) :
+        TidyCheck(kind, severity) {}
 
-    bool check(const RootSymbol& root) override {
+    bool check(const RootSymbol& root, const slang::analysis::AnalysisManager&) override {
         MainVisitor visitor(diagnostics);
         root.visit(visitor);
         return diagnostics.empty();
@@ -59,7 +60,7 @@ public:
         return "use of '{}' in port connection list, consider using '{}({})' instead";
     }
 
-    DiagnosticSeverity diagSeverity() const override { return DiagnosticSeverity::Warning; }
+    DiagnosticSeverity diagDefaultSeverity() const override { return DiagnosticSeverity::Warning; }
 
     std::string name() const override { return "NoDotVarInPortConnection"; }
 

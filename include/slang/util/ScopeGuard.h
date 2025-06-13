@@ -30,9 +30,14 @@ public:
             func();
     }
 
+    void release() noexcept { valid = false; }
+
 private:
     F func;
     bool valid = true;
 };
+
+template<typename F>
+explicit ScopeGuard(F&& f) -> ScopeGuard<F>;
 
 } // namespace slang

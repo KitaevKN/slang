@@ -21,9 +21,9 @@ void registerExpressions(py::module_& m) {
     py::class_<Expression>(m, "Expression")
         .def_readonly("kind", &Expression::kind)
         .def_readonly("type", &Expression::type)
-        .def_readonly("constant", &Expression::constant)
         .def_readonly("syntax", &Expression::syntax)
         .def_readonly("sourceRange", &Expression::sourceRange)
+        .def_property_readonly("constant", &Expression::getConstant)
         .def_property_readonly("bad", &Expression::bad)
         .def_property_readonly("isImplicitString", &Expression::isImplicitString)
         .def_property_readonly("isUnsizedInteger", &Expression::isUnsizedInteger)
@@ -229,7 +229,7 @@ void registerExpressions(py::module_& m) {
         .def_property_readonly("rangeList", &InsideExpression::rangeList);
 
     py::class_<ConcatenationExpression, Expression>(m, "ConcatenationExpression")
-        .def_property_readonly("operands", &ConcatenationExpression::operands);
+        .def_property_readonly("operands", py::overload_cast<>(&ConcatenationExpression::operands));
 
     py::class_<ReplicationExpression, Expression>(m, "ReplicationExpression")
         .def_property_readonly("count", &ReplicationExpression::count)

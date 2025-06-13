@@ -5,6 +5,7 @@
 #include "TidyDiags.h"
 #include "fmt/color.h"
 #include <algorithm>
+#include <regex>
 
 #include "slang/syntax/AllSyntax.h"
 
@@ -54,7 +55,10 @@ struct MainVisitor : public TidyVisitor, ASTVisitor<MainVisitor, true, true> {
                             std::back_inserter(unusedSignals), compare);
 
         for (auto signal : unusedSignals) {
-            if (signal.first != config.getCheckConfigs().clkName)
+            // either match against clkName or against the regex pattern
+            if (signal.first != config.getCheckConfigs().clkName &&
+                !(std::regex_match(std::string(signal.first),
+                                   config.getCheckConfigs().clkNameRegexPattern)))
                 diags.add(diag::UnusedSensitiveSignal, signal.second) << signal.first;
         }
     }
@@ -65,9 +69,11 @@ using namespace unused_sensitive_signal;
 
 class UnusedSensitiveSignal : public TidyCheck {
 public:
-    [[maybe_unused]] explicit UnusedSensitiveSignal(TidyKind kind) : TidyCheck(kind) {}
+    [[maybe_unused]] explicit UnusedSensitiveSignal(
+        TidyKind kind, std::optional<slang::DiagnosticSeverity> severity) :
+        TidyCheck(kind, severity) {}
 
-    bool check(const RootSymbol& root) override {
+    bool check(const RootSymbol& root, const slang::analysis::AnalysisManager&) override {
         MainVisitor visitor(diagnostics);
         root.visit(visitor);
         return diagnostics.empty();
@@ -81,7 +87,7 @@ public:
                "or removing it from the sensitivity list";
     }
 
-    DiagnosticSeverity diagSeverity() const override { return DiagnosticSeverity::Warning; }
+    DiagnosticSeverity diagDefaultSeverity() const override { return DiagnosticSeverity::Warning; }
 
     std::string name() const override { return "UnusedSensitiveSignal"; }
 

@@ -13,11 +13,8 @@
 #include "fmt/color.h"
 #include "fmt/format.h"
 #include "visitors/NetlistVisitor.h"
-#include <fstream>
 #include <iostream>
 #include <stdexcept>
-#include <unordered_set>
-#include <utility>
 #include <vector>
 
 #include "slang/ast/ASTSerializer.h"
@@ -27,8 +24,6 @@
 #include "slang/driver/Driver.h"
 #include "slang/text/FormatBuffer.h"
 #include "slang/text/Json.h"
-#include "slang/util/String.h"
-#include "slang/util/TimeTrace.h"
 #include "slang/util/Util.h"
 #include "slang/util/VersionInfo.h"
 
@@ -45,14 +40,14 @@ public:
     constexpr auto format(NetlistNode const& node, Context& ctx) const {
         if (node.kind == NodeKind::VariableAlias) {
             auto& aliasNode = node.as<NetlistVariableAlias>();
-            return format_to(ctx.out(), "{}{}", aliasNode.hierarchicalPath, aliasNode.overlap);
+            return fmt::format_to(ctx.out(), "{}{}", aliasNode.hierarchicalPath, aliasNode.overlap);
         }
         else if (node.kind == NodeKind::VariableDeclaration) {
             auto& declNode = node.as<NetlistVariableDeclaration>();
-            return format_to(ctx.out(), "{}", declNode.hierarchicalPath);
+            return fmt::format_to(ctx.out(), "{}", declNode.hierarchicalPath);
         }
         else {
-            return format_to(ctx.out(), "{}", node.getName());
+            return fmt::format_to(ctx.out(), "{}", node.getName());
         }
     }
 };
@@ -108,14 +103,13 @@ void printDOT(const Netlist& netlist, const std::string& fileName) {
             }
             case NodeKind::VariableReference: {
                 auto& varRef = node->as<NetlistVariableReference>();
-                if (!varRef.isLeftOperand())
+                if (!varRef.isLeftOperand()) {
                     buffer.format("  N{} [label=\"{}\\n\"]\n", node->ID, varRef.toString());
-                else if (node->edgeKind == EdgeKind::None)
+                }
+                else {
                     buffer.format("  N{} [label=\"{}\\n[Assigned to]\"]\n", node->ID,
                                   varRef.toString());
-                else
-                    buffer.format("  N{} [label=\"{}\\n[Assigned to @({})]\"]\n", node->ID,
-                                  varRef.toString(), toString(node->edgeKind));
+                }
                 break;
             }
             default:
@@ -147,7 +141,9 @@ void reportPath(Compilation& compilation, const NetlistPath& path) {
         auto* SM = compilation.getSourceManager();
         auto& location = node->symbol.location;
         auto bufferID = location.buffer();
-        SLANG_ASSERT(node->kind == NodeKind::VariableReference);
+        if (node->kind != NodeKind::VariableReference) {
+            continue;
+        }
         const auto& varRefNode = node->as<NetlistVariableReference>();
         Diagnostic diagnostic(diag::VariableReference, varRefNode.expression.sourceRange.start());
         diagnostic << varRefNode.expression.sourceRange;
@@ -164,25 +160,18 @@ void reportPath(Compilation& compilation, const NetlistPath& path) {
 }
 
 void dumpCyclesList(Compilation& compilation, Netlist& netlist,
-                    std::vector<CycleListType>* cycles) {
-    auto s = cycles->size();
-    if (!s) {
+                    std::vector<std::vector<NetlistNode const*>> const& cycles) {
+    if (cycles.empty()) {
         OS::print("No combinatorial loops detected\n");
         return;
     }
-    OS::print(fmt::format("Detected {} combinatorial loop{}:\n", s, (s > 1) ? "s" : ""));
+    OS::print(fmt::format("Detected {} combinatorial loop{}:\n", cycles.size(),
+                          cycles.size() > 1 ? "s" : ""));
     NetlistPath path;
-    for (int i = 0; i < s; i++) {
-        auto si = (*cycles)[i].size();
-        for (int j = 0; j < si; j++) {
-            auto& node = netlist.getNode((*cycles)[i][j]);
-            if (node.kind == NodeKind::VariableReference) {
-                path.add(node);
-            }
-        }
+    for (auto const& cycle : cycles) {
+        NetlistPath path(cycle);
         OS::print(fmt::format("Path length: {}\n", path.size()));
         reportPath(compilation, path);
-        path.clear();
     }
 }
 
@@ -212,11 +201,13 @@ int main(int argc, char** argv) {
     std::optional<bool> quiet;
     std::optional<bool> debug;
     std::optional<bool> combLoops;
+    std::optional<bool> unrollForLoops;
     driver.cmdLine.add("-h,--help", showHelp, "Display available options");
     driver.cmdLine.add("--version", showVersion, "Display version information and exit");
     driver.cmdLine.add("-q,--quiet", quiet, "Suppress non-essential output");
     driver.cmdLine.add("-d,--debug", debug, "Output debugging information");
     driver.cmdLine.add("-c,--comb-loops", combLoops, "Detect combinatorial loops");
+    driver.cmdLine.add("--unroll-for-loops", unrollForLoops, "Unroll procedural for loops");
 
     std::optional<std::string> astJsonFile;
     driver.cmdLine.add(
@@ -276,7 +267,8 @@ int main(int argc, char** argv) {
         bool ok = driver.parseAllSources();
 
         auto compilation = driver.createCompilation();
-        ok &= driver.reportCompilation(*compilation, *quiet);
+        driver.reportCompilation(*compilation, *quiet);
+        ok &= driver.reportDiagnostics(*quiet);
 
         if (!ok) {
             return ok;
@@ -289,7 +281,9 @@ int main(int argc, char** argv) {
 
         // Create the netlist by traversing the AST.
         Netlist netlist;
-        NetlistVisitor visitor(*compilation, netlist);
+        NetlistVisitorOptions options;
+        options.unrollForLoops = unrollForLoops.value_or(false);
+        NetlistVisitor visitor(*compilation, netlist, options);
         compilation->getRoot().visit(visitor);
         netlist.split();
         DEBUG_PRINT("Netlist has {} nodes and {} edges\n", netlist.numNodes(), netlist.numEdges());
@@ -300,11 +294,13 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        // Find combinatorial loops.
         if (combLoops == true) {
-            ElementaryCyclesSearch ecs(netlist);
-            std::vector<CycleListType>* cycles = ecs.getElementaryCycles();
+            CombLoops combLoops(netlist);
+            auto const& cycles = combLoops.getAllLoops();
             dumpCyclesList(*compilation, netlist, cycles);
         }
+
         // Find a point-to-point path in the netlist.
         if (fromPointName.has_value() && toPointName.has_value()) {
             if (!fromPointName.has_value()) {
@@ -356,9 +352,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     SLANG_CATCH(const std::exception& e) {
-#if __cpp_exceptions
-        OS::printE(fmt::format("{}\n", e.what()));
-#endif
+        SLANG_REPORT_EXCEPTION(e, "{}\n");
         return 1;
     }
 

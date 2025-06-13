@@ -16,6 +16,7 @@
 #include "slang/diagnostics/TextDiagnosticClient.h"
 #include "slang/text/Glob.h"
 #include "slang/text/SourceManager.h"
+#include "slang/util/SmallMap.h"
 
 namespace fs = std::filesystem;
 
@@ -28,10 +29,11 @@ std::string_view getDefaultOptionName(DiagCode code);
 std::span<const DiagCode> findDiagsFromOptionName(std::string_view name);
 const DiagGroup* findDefaultDiagGroup(std::string_view name);
 
+DiagnosticEngine::SymbolPathCB DiagnosticEngine::defaultSymbolPathCB;
 DiagnosticEngine::FormatterMap DiagnosticEngine::defaultFormatters;
 
 DiagnosticEngine::DiagnosticEngine(const SourceManager& sourceManager) :
-    sourceManager(sourceManager), formatters(defaultFormatters) {
+    sourceManager(sourceManager), symbolPathCB(defaultSymbolPathCB), formatters(defaultFormatters) {
 }
 
 DiagnosticEngine::~DiagnosticEngine() = default;
@@ -53,11 +55,6 @@ void DiagnosticEngine::clearCounts() {
 
 void DiagnosticEngine::setSeverity(DiagCode code, DiagnosticSeverity severity) {
     severityTable[code] = severity;
-}
-
-void DiagnosticEngine::setSeverity(const DiagGroup& group, DiagnosticSeverity severity) {
-    for (auto diag : group.getDiags())
-        setSeverity(diag, severity);
 }
 
 DiagnosticSeverity DiagnosticEngine::getSeverity(DiagCode code, SourceLocation location) const {
@@ -262,7 +259,7 @@ bool DiagnosticEngine::issueImpl(const Diagnostic& diagnostic, DiagnosticSeverit
     // Notes are ignored if location is "NoLocation" since they frequently make no
     // sense without location information.
     for (const Diagnostic& note : diagnostic.notes) {
-        if (note.location != SourceLocation::NoLocation || note.code == diag::NoteFromHere2)
+        if (note.location != SourceLocation::NoLocation || note.code.showNoteWithNoLocation())
             issue(note);
     }
 
@@ -443,21 +440,37 @@ std::string DiagnosticEngine::reportAll(const SourceManager& sourceManager,
     return client->getString();
 }
 
-void DiagnosticEngine::setDefaultWarnings() {
-    setIgnoreAllWarnings(true);
-    setSeverity(*findDiagGroup("default"sv), DiagnosticSeverity::Warning);
-}
-
 Diagnostics DiagnosticEngine::setWarningOptions(std::span<const std::string> options) {
     Diagnostics diags;
-    auto findAndSet = [&](std::string_view name, DiagnosticSeverity severity,
-                          const char* errorPrefix) {
+    std::vector<std::pair<const DiagGroup*, bool>> groupEnables;
+    std::vector<std::pair<DiagCode, bool>> codeEnables;
+    flat_hash_map<const DiagGroup*, bool> groupErrors;
+    flat_hash_map<DiagCode, bool> codeErrors;
+    bool includeDefault = true;
+
+    auto findAndSet = [&](std::string_view name, bool set, const char* errorPrefix,
+                          bool isExplicitError) {
         if (auto group = findDiagGroup(name)) {
-            setSeverity(*group, severity);
+            if (isExplicitError)
+                groupErrors[group] = set;
+            else
+                groupEnables.emplace_back(group, set);
+
+            // -Werror= also turns on the group.
+            if (isExplicitError && set)
+                groupEnables.emplace_back(group, true);
         }
         else if (auto codes = findFromOptionName(name); !codes.empty()) {
-            for (auto code : codes)
-                setSeverity(code, severity);
+            for (auto code : codes) {
+                if (isExplicitError)
+                    codeErrors[code] = set;
+                else
+                    codeEnables.emplace_back(code, set);
+
+                // -Werror= also turns on the code.
+                if (isExplicitError && set)
+                    codeEnables.emplace_back(code, true);
+            }
         }
         else {
             auto& diag = diags.add(diag::UnknownWarningOption, SourceLocation::NoLocation);
@@ -465,35 +478,82 @@ Diagnostics DiagnosticEngine::setWarningOptions(std::span<const std::string> opt
         }
     };
 
+    // By default all warnings are turned *on*, and we only want the default set by default,
+    // so turn off all warnings here and we'll add the default set at the end.
+    setIgnoreAllWarnings(true);
+
     for (auto& arg : options) {
         if (arg == "everything") {
             // Enable all warnings.
-            clearMappings(DiagnosticSeverity::Ignored);
             setIgnoreAllWarnings(false);
         }
         else if (arg == "none") {
             // Disable all warnings.
-            clearMappings(DiagnosticSeverity::Warning);
+            includeDefault = false;
             setIgnoreAllWarnings(true);
         }
         else if (arg == "error") {
-            for (auto it = severityTable.begin(); it != severityTable.end(); it++) {
-                if (it->second == DiagnosticSeverity::Warning)
-                    it->second = DiagnosticSeverity::Error;
-            }
             setWarningsAsErrors(true);
         }
         else if (arg.starts_with("error=")) {
-            findAndSet(arg.substr(6), DiagnosticSeverity::Error, "-Werror=");
+            findAndSet(arg.substr(6), /* set */ true, "-Werror=", /* isExplicitError */ true);
         }
         else if (arg.starts_with("no-error=")) {
-            findAndSet(arg.substr(9), DiagnosticSeverity::Warning, "-Wno-error=");
+            findAndSet(arg.substr(9), /* set */ false, "-Wno-error=", /* isExplicitError */ true);
         }
         else if (arg.starts_with("no-")) {
-            findAndSet(arg.substr(3), DiagnosticSeverity::Ignored, "-Wno-");
+            findAndSet(arg.substr(3), /* set */ false, "-Wno-", /* isExplicitError */ false);
         }
         else {
-            findAndSet(arg, DiagnosticSeverity::Warning, "-W");
+            findAndSet(arg, /* set */ true, "-W", /* isExplicitError */ false);
+        }
+    }
+
+    auto handleGroup = [&](const DiagGroup* group, bool set) {
+        DiagnosticSeverity severity;
+        if (!set)
+            severity = DiagnosticSeverity::Ignored;
+        else if (auto it = groupErrors.find(group); it != groupErrors.end())
+            severity = it->second ? DiagnosticSeverity::Error : DiagnosticSeverity::Warning;
+        else
+            severity = warningsAsErrors ? DiagnosticSeverity::Error : DiagnosticSeverity::Warning;
+
+        for (auto code : group->getDiags())
+            severityTable.try_emplace(code, severity);
+    };
+
+    // If they didn't pass "none" then enable the default set of warnings.
+    if (includeDefault) {
+        auto group = findDiagGroup("default"sv);
+        SLANG_ASSERT(group);
+        handleGroup(group, true);
+    }
+
+    // Apply all of the collected settings to the severity table.
+    for (auto& [group, set] : groupEnables)
+        handleGroup(group, set);
+
+    // Special case for diagnostics with an explicit severity set by API that
+    // the user is now trying to downgrade to be not an error.
+    for (auto& [code, set] : codeErrors) {
+        if (!set) {
+            auto it = severityTable.find(code);
+            if (it != severityTable.end() && it->second == DiagnosticSeverity::Error)
+                it->second = DiagnosticSeverity::Warning;
+        }
+    }
+
+    for (auto& [code, set] : codeEnables) {
+        if (!set) {
+            severityTable[code] = DiagnosticSeverity::Ignored;
+        }
+        else if (auto it = codeErrors.find(code); it != codeErrors.end()) {
+            severityTable[code] = it->second ? DiagnosticSeverity::Error
+                                             : DiagnosticSeverity::Warning;
+        }
+        else {
+            severityTable[code] = warningsAsErrors ? DiagnosticSeverity::Error
+                                                   : DiagnosticSeverity::Warning;
         }
     }
 

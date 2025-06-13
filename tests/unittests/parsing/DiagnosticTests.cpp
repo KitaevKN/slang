@@ -4,7 +4,10 @@
 #include "Test.h"
 
 #include "slang/diagnostics/DiagnosticClient.h"
+#include "slang/diagnostics/JsonDiagnosticClient.h"
 #include "slang/diagnostics/TextDiagnosticClient.h"
+#include "slang/parsing/Lexer.h"
+#include "slang/text/Json.h"
 #include "slang/text/SourceManager.h"
 
 TEST_CASE("Diagnostic Line Number") {
@@ -303,8 +306,8 @@ TEST_CASE("Multiple ranges split between macro and not") {
 `define PASS(asdf) asdf
 
 module m;
-    bit b;
-    int j = (b) `PASS([1]);
+    struct { bit c; } b;
+    int j = (b).c `PASS([1]);
 endmodule
 )");
 
@@ -314,9 +317,9 @@ endmodule
     auto& diagnostics = compilation.getAllDiagnostics();
     std::string result = "\n" + report(diagnostics);
     CHECK(result == R"(
-source:6:24: error: scalar type cannot be indexed
-    int j = (b) `PASS([1]);
-             ~         ^
+source:6:26: error: scalar type cannot be indexed
+    int j = (b).c `PASS([1]);
+             ~~~~        ^
 source:2:20: note: expanded from macro 'PASS'
 `define PASS(asdf) asdf
                    ^~~~
@@ -473,8 +476,6 @@ TEST_CASE("DiagnosticEngine::setWarningOptions") {
         "empty-stmt"s, "no-extra"s, "asdf"s};
 
     DiagnosticEngine engine(getSourceManager());
-    engine.setDefaultWarnings();
-
     Diagnostics diags = engine.setWarningOptions(options);
     CHECK(diags.size() == 1);
 
@@ -483,6 +484,8 @@ TEST_CASE("DiagnosticEngine::setWarningOptions") {
 }
 
 TEST_CASE("Diagnostic Pragmas") {
+    SyntaxTree::getDefaultSourceManager().clearDiagnosticDirectives();
+
     auto tree = SyntaxTree::fromText(R"(
 module m;
     ; // warn
@@ -549,9 +552,6 @@ source:3:24: warning: unknown character escape sequence '\🍌' [-Wunknown-escap
 source:4:42: error: UTF-8 sequence in source text; SystemVerilog identifiers must be ASCII
     int         /* // 꿽꿽꿽꿽꿽꿽꿽 */          갑곯꿽 = "꿽꿽꿽"; // 꿽꿽꿽꿽꿽꿽꿽
                                                  ^
-source:4:42: error: expected a declaration name
-    int         /* // 꿽꿽꿽꿽꿽꿽꿽 */          갑곯꿽 = "꿽꿽꿽"; // 꿽꿽꿽꿽꿽꿽꿽
-                                                 ^
 )";
     CHECK(result == check);
 }
@@ -575,4 +575,176 @@ source:3:33: error: use of undeclared identifier 'a'
     int i = /* asdf ä<U+19><U+1057B> */ a;
                                         ^
 )");
+}
+
+TEST_CASE("JSON DiagnosticClient") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    int i = 1;;
+    int j = q;
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    DiagnosticEngine engine(tree->sourceManager());
+
+    JsonWriter writer;
+    writer.setPrettyPrint(true);
+    writer.startArray();
+
+    auto client = std::make_shared<JsonDiagnosticClient>(writer);
+    engine.addClient(client);
+    for (auto& diag : compilation.getAllDiagnostics())
+        engine.issue(diag);
+
+    writer.endArray();
+
+    CHECK("\n"s + std::string(writer.view()) == R"(
+[
+  {
+    "severity": "warning",
+    "message": "extra ';' has no effect",
+    "optionName": "empty-member",
+    "location": "source:3:15",
+    "symbolPath": "m"
+  },
+  {
+    "severity": "error",
+    "message": "use of undeclared identifier 'q'",
+    "location": "source:4:13",
+    "symbolPath": "m"
+  }
+])");
+}
+
+TEST_CASE("Diagnostic comment directives") {
+    SyntaxTree::getDefaultSourceManager().clearDiagnosticDirectives();
+
+    LexerOptions options;
+    options.commentHandlers["slang"]["lint_off"] = {CommentHandler::LintOff};
+    options.commentHandlers["slang"]["lint_on"] = {CommentHandler::LintOn};
+    options.commentHandlers["slang"]["lint_save"] = {CommentHandler::LintSave};
+    options.commentHandlers["slang"]["lint_restore"] = {CommentHandler::LintRestore};
+
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    ; // warn
+
+    // slang lint_off empty-member
+    ; // hidden
+    // slang lint_save
+    /* slang lint_on empty-member */
+    ; // warn
+    /* slang lint_restore */
+    ; // hidden
+endmodule
+)",
+                                     options);
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    DiagnosticEngine engine(tree->sourceManager());
+    Diagnostics pragmaDiags = engine.setMappingsFromPragmas();
+    if (!pragmaDiags.empty())
+        FAIL_CHECK(report(pragmaDiags));
+
+    auto client = std::make_shared<TextDiagnosticClient>();
+    engine.addClient(client);
+    for (auto& diag : compilation.getAllDiagnostics())
+        engine.issue(diag);
+
+    CHECK("\n"s + client->getString() == R"(
+source:3:5: warning: extra ';' has no effect [-Wempty-member]
+    ; // warn
+    ^
+source:9:5: warning: extra ';' has no effect [-Wempty-member]
+    ; // warn
+    ^
+)");
+}
+
+TEST_CASE("Diagnostic warning option corner cases") {
+    auto createEngine = [](std::vector<std::string> options) {
+        DiagnosticEngine engine(getSourceManager());
+        engine.setSeverity(diag::UnknownSystemName, DiagnosticSeverity::Error);
+        engine.setSeverity(diag::StaticInitializerMustBeExplicit, DiagnosticSeverity::Ignored);
+
+        auto diags = engine.setWarningOptions(options);
+        CHECK(diags.empty());
+        return engine;
+    };
+
+    {
+        auto engine = createEngine({"no-constant-conversion"s, "everything"s});
+        CHECK(engine.getSeverity(diag::ConstantConversion, {}) == DiagnosticSeverity::Ignored);
+    }
+    {
+        auto engine = createEngine({"constant-conversion"s, "none"s});
+        CHECK(engine.getSeverity(diag::ConstantConversion, {}) == DiagnosticSeverity::Warning);
+    }
+    {
+        auto engine = createEngine({"error=constant-conversion"s, "none"s});
+        CHECK(engine.getSeverity(diag::ConstantConversion, {}) == DiagnosticSeverity::Error);
+    }
+    {
+        auto engine = createEngine(
+            {"no-error=constant-conversion"s, "error"s, "constant-conversion"s});
+        CHECK(engine.getSeverity(diag::ConstantConversion, {}) == DiagnosticSeverity::Warning);
+    }
+    {
+        auto engine = createEngine({"error", "constant-conversion"s, "none"s});
+        CHECK(engine.getSeverity(diag::ConstantConversion, {}) == DiagnosticSeverity::Error);
+    }
+    {
+        auto engine = createEngine({"constant-conversion"s, "no-conversion"s});
+        CHECK(engine.getSeverity(diag::ConstantConversion, {}) == DiagnosticSeverity::Warning);
+    }
+    {
+        auto engine = createEngine({"error=constant-conversion"s, "no-error=conversion"s});
+        CHECK(engine.getSeverity(diag::ConstantConversion, {}) == DiagnosticSeverity::Error);
+    }
+    {
+        auto engine = createEngine({"none"s});
+        CHECK(engine.getSeverity(diag::RealLiteralUnderflow, {}) == DiagnosticSeverity::Ignored);
+    }
+    {
+        auto engine = createEngine({"error=constant-conversion"s, "constant-conversion"s});
+        CHECK(engine.getSeverity(diag::ConstantConversion, {}) == DiagnosticSeverity::Error);
+    }
+    {
+        auto engine = createEngine({"no-constant-conversion"s, "no-error=constant-conversion"s});
+        CHECK(engine.getSeverity(diag::ConstantConversion, {}) == DiagnosticSeverity::Ignored);
+    }
+    {
+        auto engine = createEngine(
+            {"error", "no-error=constant-conversion"s, "constant-conversion"s});
+        CHECK(engine.getSeverity(diag::ConstantConversion, {}) == DiagnosticSeverity::Warning);
+    }
+    {
+        auto engine = createEngine({"no-error=constant-conversion"s});
+        CHECK(engine.getSeverity(diag::ConstantConversion, {}) == DiagnosticSeverity::Ignored);
+    }
+    {
+        auto engine = createEngine({});
+        CHECK(engine.getSeverity(diag::UnknownSystemName, {}) == DiagnosticSeverity::Error);
+        CHECK(engine.getSeverity(diag::StaticInitializerMustBeExplicit, {}) ==
+              DiagnosticSeverity::Ignored);
+    }
+    {
+        auto engine = createEngine({"none"s});
+        CHECK(engine.getSeverity(diag::UnknownSystemName, {}) == DiagnosticSeverity::Error);
+        CHECK(engine.getSeverity(diag::StaticInitializerMustBeExplicit, {}) ==
+              DiagnosticSeverity::Ignored);
+    }
+    {
+        auto engine = createEngine({"no-error=unknown-sys-name"s});
+        CHECK(engine.getSeverity(diag::UnknownSystemName, {}) == DiagnosticSeverity::Warning);
+    }
+    {
+        auto engine = createEngine({"no-unknown-sys-name"s});
+        CHECK(engine.getSeverity(diag::UnknownSystemName, {}) == DiagnosticSeverity::Ignored);
+    }
 }

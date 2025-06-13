@@ -56,20 +56,10 @@ enum class NodeKind {
 
 enum class VariableSelectorKind { ElementSelect, RangeSelect, MemberAccess };
 
-static std::string getSymbolHierPath(const ast::Symbol& symbol) {
-
-    // Resolve the hierarchical path of the symbol.
-    std::string buffer;
-    symbol.getHierarchicalPath(buffer);
-
-    return buffer;
-}
-
 static std::string resolveSymbolHierPath(const ast::Symbol& symbol) {
 
     // Resolve the hierarchical path of the symbol.
-    std::string buffer;
-    symbol.getHierarchicalPath(buffer);
+    auto buffer = symbol.getHierarchicalPath();
 
     // Is the symbol is a modport, use the modport name to adjust the
     // hierachical path to match the corresponding variable declaration in the
@@ -220,13 +210,15 @@ struct VariableMemberAccess : public VariableSelectorBase {
 /// A class representing a dependency between two variables in the netlist.
 class NetlistEdge : public DirectedEdge<NetlistNode, NetlistEdge> {
 public:
-    NetlistEdge(NetlistNode& sourceNode, NetlistNode& targetNode) :
-        DirectedEdge(sourceNode, targetNode) {}
+    NetlistEdge(NetlistNode& sourceNode, NetlistNode& targetNode,
+                ast::EdgeKind edgeKind = ast::EdgeKind::None) :
+        DirectedEdge(sourceNode, targetNode), edgeKind(edgeKind) {}
 
     void disable() { disabled = true; }
 
 public:
     bool disabled{};
+    ast::EdgeKind edgeKind;
 };
 
 /// A class representing a node in the netlist, corresponding to the appearance
@@ -234,7 +226,7 @@ public:
 class NetlistNode : public Node<NetlistNode, NetlistEdge> {
 public:
     NetlistNode(NodeKind kind, const ast::Symbol& symbol) :
-        ID(++nextID), kind(kind), symbol(symbol), edgeKind(ast::EdgeKind::None) {};
+        ID(++nextID), kind(kind), symbol(symbol) {};
     ~NetlistNode() override = default;
 
     template<typename T>
@@ -246,7 +238,7 @@ public:
     template<typename T>
     const T& as() const {
         SLANG_ASSERT(T::isKind(kind));
-        return const_cast<T&>(this->as<T>());
+        return *static_cast<const T*>(this);
     }
 
     /// Return the out degree of this node, including only enabled edges.
@@ -266,7 +258,6 @@ public:
     size_t ID;
     NodeKind kind;
     const ast::Symbol& symbol;
-    ast::EdgeKind edgeKind;
     bool blocked{};
 
 private:
@@ -387,7 +378,7 @@ public:
     NetlistPortDeclaration& addPortDeclaration(const ast::Symbol& symbol) {
         auto nodePtr = std::make_unique<NetlistPortDeclaration>(symbol);
         auto& node = nodePtr->as<NetlistPortDeclaration>();
-        symbol.getHierarchicalPath(node.hierarchicalPath);
+        symbol.appendHierarchicalPath(node.hierarchicalPath);
         SLANG_ASSERT(lookupPort(nodePtr->hierarchicalPath) == nullptr &&
                      "Port declaration already exists");
         nodes.push_back(std::move(nodePtr));
@@ -397,7 +388,7 @@ public:
 
     /// Add a variable declaration node to the netlist.
     NetlistVariableDeclaration& addVariableDeclaration(const ast::Symbol& symbol) {
-        std::string hierPath = getSymbolHierPath(symbol);
+        std::string hierPath = symbol.getHierarchicalPath();
         if (auto* result = lookupVariable(hierPath)) {
             DEBUG_PRINT("Variable declaration for {} already exists", hierPath);
             return *result;
@@ -416,7 +407,7 @@ public:
     NetlistVariableAlias& addVariableAlias(const ast::Symbol& symbol, ConstantRange overlap) {
         auto nodePtr = std::make_unique<NetlistVariableAlias>(symbol, overlap);
         auto& node = nodePtr->as<NetlistVariableAlias>();
-        symbol.getHierarchicalPath(node.hierarchicalPath);
+        symbol.appendHierarchicalPath(node.hierarchicalPath);
         nodes.push_back(std::move(nodePtr));
         DEBUG_PRINT("New node: variable alias {}\n", node.hierarchicalPath);
         return node;
@@ -438,7 +429,7 @@ public:
 
     NetlistEdge& addEdge(NetlistNode& sourceNode, NetlistNode& targetNode, ast::EdgeKind edgeKind) {
         auto& edge = DirectedGraph<NetlistNode, NetlistEdge>::addEdge(sourceNode, targetNode);
-        targetNode.edgeKind = edgeKind;
+        edge.edgeKind = edgeKind;
         return edge;
     }
 
@@ -531,7 +522,7 @@ public:
                             outEdges.push_back(outEdge.get());
                         }
                     }
-                    mods.emplace_back(&varDeclNode, sourceVarRef.bounds, inEdge, outEdges);
+                    mods.push_back({&varDeclNode, sourceVarRef.bounds, inEdge, outEdges});
                 }
             }
         }

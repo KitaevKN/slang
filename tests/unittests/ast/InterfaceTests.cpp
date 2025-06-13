@@ -416,31 +416,6 @@ endmodule
     CHECK(j.getValue().integer() == 3);
 }
 
-TEST_CASE("Modport multi-driven errors") {
-    auto tree = SyntaxTree::fromText(R"(
-interface I;
-    int i;
-    modport m(output i);
-endinterface
-
-module m(I.m i);
-    assign i.i = 1;
-endmodule
-
-module top;
-    I i();
-    m m1(i), m2(i);
-endmodule
-)");
-
-    Compilation compilation;
-    compilation.addSyntaxTree(tree);
-
-    auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 1);
-    CHECK(diags[0].code == diag::MultipleContAssigns);
-}
-
 TEST_CASE("Uninstantiated virtual interface param regress GH #679") {
     auto tree = SyntaxTree::fromText(R"(
 interface I;
@@ -608,30 +583,6 @@ endmodule
     CHECK(diags[1].code == diag::ParamHasNoValue);
 }
 
-TEST_CASE("Interface array multi-driven error regress") {
-    auto tree = SyntaxTree::fromText(R"(
-interface I;
-    int i;
-    modport m(output i);
-endinterface
-
-module mod(I.m arr[3]);
-    for (genvar i = 0; i < 3; i++) begin
-        always_comb arr[i].i = i;
-    end
-endmodule
-
-module top;
-    I i [3]();
-    mod m1(i);
-endmodule
-)");
-
-    Compilation compilation;
-    compilation.addSyntaxTree(tree);
-    NO_COMPILATION_ERRORS;
-}
-
 TEST_CASE("Interface-based typedef") {
     auto tree = SyntaxTree::fromText(R"(
 interface intf_i;
@@ -723,4 +674,174 @@ endmodule
     auto& diags = compilation.getAllDiagnostics();
     REQUIRE(diags.size() == 1);
     CHECK(diags[0].code == diag::UndeclaredIdentifier);
+}
+
+TEST_CASE("Iface array with different declared indices regress -- GH #1152") {
+    auto tree = SyntaxTree::fromText(R"(
+interface bus();
+	logic a;
+	logic b;
+endinterface
+
+module submodule(bus iface [3:2]);
+	assign iface[2].a = iface[3].b;
+endmodule
+
+module top();
+	bus iface[1:0]();
+	submodule inst(iface);
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Virtual interface declaration errors") {
+    auto tree = SyntaxTree::fromText(R"(
+localparam type requestType = byte;
+localparam type responseType = int;
+
+interface I;
+    wire r;
+    modport ii(input r);
+endinterface
+
+module testMod#(N=16);
+  wire clk, rst;
+  I i();
+
+  allIfc#(N) allInst(clk, rst, i, i.ii);
+
+  virtual allIfc#(N) allInst1;
+  sliceIfc sliceInst();
+  virtual sliceIfc sliceInst1;
+endmodule:testMod
+
+interface automatic allIfc#(N=1)(input clk, rst, I i, I.ii i1);
+  var requestType Requests[N];
+  var responseType Responses[N];
+
+  function requestType requestRead(int index);
+    return Requests[index];
+  endfunction
+
+  function void responseWrite(int index, responseType response);
+    Responses[index] <= response;
+  endfunction
+
+  modport clientMp(output Requests, input Responses,
+                   input clk, rst);
+  modport serverMp(input Requests, output Responses,
+                   import requestRead, responseWrite,
+                   input clk, rst);
+endinterface:allIfc
+
+interface automatic sliceIfc#(I=0)();
+  interface II();
+      logic reset;
+  endinterface
+
+  II ii();
+  wire reset = ii.reset;
+
+  I i();
+  allIfc allInst(.clk(), .rst(), .i(i), .i1(i.ii));
+
+  var requestType request;
+  var responseType response;
+
+  assign allInst.Requests[I] = request;
+  assign response = allInst.Responses[I];
+
+  function void requestWrite(requestType req);
+    request <= req;
+  endfunction
+
+  function responseType responseRead();
+    return response;
+  endfunction
+
+  wire clk = testMod.clk;  // invalid
+  wire rst = testMod.rst;  // invalid
+
+  modport clientMp(output request, input response,
+                   import requestWrite, responseRead,
+                   input clk, rst);
+endinterface:sliceIfc
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 2);
+    CHECK(diags[0].code == diag::VirtualIfaceIfacePort);
+    CHECK(diags[1].code == diag::VirtualIfaceHierRef);
+}
+
+TEST_CASE("Extern and export methods with instance caching") {
+    auto tree = SyntaxTree::fromText(R"(
+interface I;
+    extern task foo;
+    modport m(export foo);
+    modport n(import task foo);
+endinterface
+
+module m(I.m i);
+    task i.foo; endtask
+endmodule
+
+module n(I i);
+    o o1(i);
+endmodule
+
+module o(I i);
+    m m1(i);
+endmodule
+
+module top;
+    I i1();
+    n m1(i1), m2(i1);
+
+    I i2();
+    n m3(i2);
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 1);
+    CHECK(diags[0].code == diag::DupInterfaceExternMethod);
+}
+
+TEST_CASE("Instance caching with iface port side effects and downward names") {
+    auto tree = SyntaxTree::fromText(R"(
+interface I;
+    logic l;
+endinterface
+
+module m(I i);
+    assign i.l = 1;
+endmodule
+
+module o(I i);
+    m m1(i);
+    int a;
+endmodule
+
+module top;
+    I i [3]();
+    o o1(i[0]), o2(i[1]);
+
+    assign o2.a = 1;
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
 }

@@ -38,6 +38,8 @@ namespace slang::ast {
 
 using namespace syntax;
 
+const InvalidSymbol InvalidSymbol::Instance;
+
 const Scope* Symbol::getHierarchicalParent() const {
     if (kind == SymbolKind::InstanceBody) {
         auto parentInst = as<InstanceBodySymbol>().parentInstance;
@@ -167,21 +169,39 @@ static void getHierarchicalPathImpl(const Symbol& symbol, FormatBuffer& buffer) 
             inst.getArrayDimensions(instanceDimVec);
 
             std::span<const ConstantRange> instanceDims = instanceDimVec;
-            std::span<const int32_t> arrayPath = inst.arrayPath;
+            std::span<const uint32_t> arrayPath = inst.arrayPath;
             SLANG_ASSERT(instanceDims.size() == arrayPath.size());
 
-            for (size_t i = 0; i < instanceDims.size(); i++) {
-                auto dim = instanceDims[i];
-                auto idx = dim.translateIndex(arrayPath[i]);
-                idx += dim.lower();
+            for (size_t i = 0; i < instanceDims.size(); i++)
+                buffer.format("[{}]", int32_t(arrayPath[i]) + instanceDims[i].lower());
+        }
+    }
+    else if (current->kind == SymbolKind::ClassType) {
+        auto& classType = current->as<ClassType>();
+        if (!classType.genericParameters.empty()) {
+            buffer.append("#(");
+            for (size_t i = 0; i < classType.genericParameters.size(); i++) {
+                if (i > 0)
+                    buffer.append(",");
 
-                buffer.format("[{}]", idx);
+                auto& param = *classType.genericParameters[i];
+                if (param.kind == SymbolKind::TypeParameter)
+                    buffer.append(param.as<TypeParameterSymbol>().targetType.getType().toString());
+                else
+                    buffer.append(param.as<ParameterSymbol>().getValue().toString());
             }
+            buffer.append(")");
         }
     }
 }
 
-void Symbol::getHierarchicalPath(std::string& result) const {
+std::string Symbol::getHierarchicalPath() const {
+    std::string buf;
+    appendHierarchicalPath(buf);
+    return buf;
+}
+
+void Symbol::appendHierarchicalPath(std::string& result) const {
     FormatBuffer buffer;
     getHierarchicalPathImpl(*this, buffer);
     if (buffer.empty())
@@ -212,7 +232,7 @@ static void getLexicalPathImpl(const Symbol& symbol, std::string& buffer) {
         buffer.append(symbol.name);
 }
 
-void Symbol::getLexicalPath(std::string& buffer) const {
+void Symbol::appendLexicalPath(std::string& buffer) const {
     getLexicalPathImpl(*this, buffer);
 }
 

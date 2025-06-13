@@ -7,6 +7,7 @@
 //------------------------------------------------------------------------------
 
 #include "NetlistTest.h"
+#include "Test.h"
 
 //===---------------------------------------------------------------------===//
 // Tests for name resolution.
@@ -77,12 +78,34 @@ module t33 #(
 
   property test_prop;
     @(posedge clk) disable iff (MODE != 3'd0)
-    !($isunknown({a,b,c})) &
+    (!$isunknown({a,b,c})) &
       a & (b == 2'b01)
       |-> (c_n[15:12] == c[15:12]);
   endproperty
   tp_inst: assert property (test_prop) else
         $error("prop error");
+endmodule
+)");
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+    auto netlist = createNetlist(compilation);
+    CHECK(netlist.numNodes() > 0);
+}
+
+TEST_CASE("Declaration order") {
+    // Test that out of order declarations are handled correctly.
+    auto tree = SyntaxTree::fromText(R"(
+module top();
+    initial begin
+        m2.c = 1'b0;
+    end
+
+    m1 m2();
+endmodule
+
+module m1();
+    reg c;
 endmodule
 )");
     Compilation compilation;

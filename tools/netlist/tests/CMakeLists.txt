@@ -8,8 +8,8 @@ add_executable(
   ../../../tests/unittests/main.cpp
   ../../../tests/unittests/Test.cpp
   ../source/Netlist.cpp
-  ../source/CombLoops.cpp
   CombLoopsTests.cpp
+  CycleDetectorTests.cpp
   DepthFirstSearchTests.cpp
   DirectedGraphTests.cpp
   NameTests.cpp
@@ -17,16 +17,12 @@ add_executable(
   SplitTests.cpp
   VariableSelectorsTests.cpp)
 
-target_link_libraries(
-  netlist_unittests
-  PRIVATE slang::slang Catch2::Catch2
-  PUBLIC ${SLANG_LIBRARIES})
+target_link_libraries(netlist_unittests PRIVATE slang::slang Catch2::Catch2)
 
 target_compile_definitions(netlist_unittests PRIVATE UNITTESTS)
 
-target_include_directories(
-  netlist_unittests PRIVATE ../include ../../../include
-                            ../../../tests/unittests)
+target_include_directories(netlist_unittests PRIVATE ../include
+                                                     ../../../tests/unittests)
 
 add_test(NAME netlist_unittests COMMAND netlist_unittests)
 

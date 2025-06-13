@@ -55,12 +55,66 @@ void pySyntaxVisit(const SyntaxNode& sn, py::object f) {
     sn.visit(visitor);
 }
 
+class PySyntaxRewriter : public SyntaxRewriter<PySyntaxRewriter> {
+public:
+    PySyntaxRewriter(pybind11::function handler) : handler(std::move(handler)) {}
+
+    void visit(const SyntaxNode& node) {
+        try {
+            handler(pybind11::cast(&node), pybind11::cast(this));
+        }
+        catch (const pybind11::error_already_set& e) {
+            throw;
+        }
+        visitDefault(node);
+    }
+
+    // --- Expose protected base methods via public wrappers ---
+    void py_remove(const SyntaxNode& node) { this->remove(node); }
+
+    void py_replace(const SyntaxNode& oldNode, SyntaxNode& newNode) {
+        this->replace(oldNode, cloneNode(newNode));
+    }
+
+    void py_insertBefore(const SyntaxNode& node, SyntaxNode& newNode) {
+        this->insertBefore(node, cloneNode(newNode));
+    }
+
+    void py_insertAfter(const SyntaxNode& node, SyntaxNode& newNode) {
+        this->insertAfter(node, cloneNode(newNode));
+    }
+
+    void py_insertAtFront(const SyntaxListBase& list, SyntaxNode& newNode, Token separator = {}) {
+        this->insertAtFront(list, cloneNode(newNode), separator);
+    }
+
+    void py_insertAtBack(const SyntaxListBase& list, SyntaxNode& newNode, Token separator = {}) {
+        this->insertAtBack(list, cloneNode(newNode), separator);
+    }
+
+    SyntaxFactory& getFactory() { return factory; }
+
+private:
+    pybind11::function handler;
+
+    SyntaxNode& cloneNode(const SyntaxNode& node) {
+        return *slang::syntax::deepClone(node, this->alloc);
+    }
+};
+
+std::shared_ptr<SyntaxTree> pySyntaxRewrite(const std::shared_ptr<SyntaxTree>& tree,
+                                            pybind11::function handler) {
+    PySyntaxRewriter rewriter(std::move(handler));
+    return rewriter.transform(tree);
+}
+
 } // end namespace
 
 void registerSyntax(py::module_& m) {
     EXPOSE_ENUM(m, TriviaKind);
     EXPOSE_ENUM(m, TokenKind);
     EXPOSE_ENUM(m, SyntaxKind);
+    EXPOSE_ENUM(m, KnownSystemName);
 
     py::class_<Trivia>(m, "Trivia")
         .def(py::init<>())
@@ -76,28 +130,53 @@ void registerSyntax(py::module_& m) {
 
     py::class_<Token>(m, "Token")
         .def(py::init<>())
-        .def(py::init<BumpAllocator&, TokenKind, std::span<Trivia const>, std::string_view,
-                      SourceLocation>(),
-             "alloc"_a, "kind"_a, "trivia"_a, "rawText"_a, "location"_a)
-        .def(py::init<BumpAllocator&, TokenKind, std::span<Trivia const>, std::string_view,
-                      SourceLocation, std::string_view>(),
-             "alloc"_a, "kind"_a, "trivia"_a, "rawText"_a, "location"_a, "strText"_a)
-        .def(py::init<BumpAllocator&, TokenKind, std::span<Trivia const>, std::string_view,
-                      SourceLocation, SyntaxKind>(),
-             "alloc"_a, "kind"_a, "trivia"_a, "rawText"_a, "location"_a, "directive"_a)
-        .def(py::init<BumpAllocator&, TokenKind, std::span<Trivia const>, std::string_view,
-                      SourceLocation, logic_t>(),
-             "alloc"_a, "kind"_a, "trivia"_a, "rawText"_a, "location"_a, "bit"_a)
-        .def(py::init<BumpAllocator&, TokenKind, std::span<Trivia const>, std::string_view,
-                      SourceLocation, const SVInt&>(),
-             "alloc"_a, "kind"_a, "trivia"_a, "rawText"_a, "location"_a, "value"_a)
-        .def(py::init<BumpAllocator&, TokenKind, std::span<Trivia const>, std::string_view,
-                      SourceLocation, double, bool, std::optional<TimeUnit>>(),
-             "alloc"_a, "kind"_a, "trivia"_a, "rawText"_a, "location"_a, "value"_a, "outOfRange"_a,
-             "timeUnit"_a)
-        .def(py::init<BumpAllocator&, TokenKind, std::span<Trivia const>, std::string_view,
-                      SourceLocation, LiteralBase, bool>(),
-             "alloc"_a, "kind"_a, "trivia"_a, "rawText"_a, "location"_a, "base"_a, "isSigned"_a)
+        .def(py::init([](BumpAllocator& alloc, TokenKind kind, std::span<Trivia const> trivia,
+                         std::string_view rawText, SourceLocation location) {
+                 return Token(alloc, kind, alloc.copyFrom(trivia), rawText, location);
+             }),
+             py::keep_alive<1, 2>(), py::keep_alive<1, 4>(), "alloc"_a, "kind"_a, "trivia"_a,
+             "rawText"_a, "location"_a)
+        .def(py::init([](BumpAllocator& alloc, TokenKind kind, std::span<Trivia const> trivia,
+                         std::string_view rawText, SourceLocation location,
+                         std::string_view strText) {
+                 return Token(alloc, kind, alloc.copyFrom(trivia), rawText, location, strText);
+             }),
+             py::keep_alive<1, 2>(), py::keep_alive<1, 4>(), "alloc"_a, "kind"_a, "trivia"_a,
+             "rawText"_a, "location"_a, "strText"_a)
+        .def(py::init([](BumpAllocator& alloc, TokenKind kind, std::span<Trivia const> trivia,
+                         std::string_view rawText, SourceLocation location, SyntaxKind directive) {
+                 return Token(alloc, kind, alloc.copyFrom(trivia), rawText, location, directive);
+             }),
+             py::keep_alive<1, 2>(), py::keep_alive<1, 4>(), "alloc"_a, "kind"_a, "trivia"_a,
+             "rawText"_a, "location"_a, "directive"_a)
+        .def(py::init([](BumpAllocator& alloc, TokenKind kind, std::span<Trivia const> trivia,
+                         std::string_view rawText, SourceLocation location, logic_t bit) {
+                 return Token(alloc, kind, alloc.copyFrom(trivia), rawText, location, bit);
+             }),
+             py::keep_alive<1, 2>(), py::keep_alive<1, 4>(), "alloc"_a, "kind"_a, "trivia"_a,
+             "rawText"_a, "location"_a, "bit"_a)
+        .def(py::init([](BumpAllocator& alloc, TokenKind kind, std::span<Trivia const> trivia,
+                         std::string_view rawText, SourceLocation location, const SVInt& value) {
+                 return Token(alloc, kind, alloc.copyFrom(trivia), rawText, location, value);
+             }),
+             py::keep_alive<1, 2>(), py::keep_alive<1, 4>(), "alloc"_a, "kind"_a, "trivia"_a,
+             "rawText"_a, "location"_a, "value"_a)
+        .def(py::init([](BumpAllocator& alloc, TokenKind kind, std::span<Trivia const> trivia,
+                         std::string_view rawText, SourceLocation location, double realValue,
+                         bool outOfRange, std::optional<TimeUnit> timeUnit) {
+                 return Token(alloc, kind, alloc.copyFrom(trivia), rawText, location, realValue,
+                              outOfRange, timeUnit);
+             }),
+             py::keep_alive<1, 2>(), py::keep_alive<1, 4>(), "alloc"_a, "kind"_a, "trivia"_a,
+             "rawText"_a, "location"_a, "value"_a, "outOfRange"_a, "timeUnit"_a)
+        .def(py::init([](BumpAllocator& alloc, TokenKind kind, std::span<Trivia const> trivia,
+                         std::string_view rawText, SourceLocation location, LiteralBase base,
+                         bool isSigned) {
+                 return Token(alloc, kind, alloc.copyFrom(trivia), rawText, location, base,
+                              isSigned);
+             }),
+             py::keep_alive<1, 2>(), py::keep_alive<1, 4>(), "alloc"_a, "kind"_a, "trivia"_a,
+             "rawText"_a, "location"_a, "base"_a, "isSigned"_a)
         .def_readonly("kind", &Token::kind)
         .def_property_readonly("isMissing", &Token::isMissing)
         .def_property_readonly("range", &Token::range)
@@ -181,7 +260,11 @@ void registerSyntax(py::module_& m) {
 
                  if (auto node = self.childNode(i))
                      return py::cast(node, byrefint, py::cast(&self));
-                 return py::cast(self.childToken(i));
+
+                 if (auto token = self.childToken(i))
+                     return py::cast(self.childToken(i));
+
+                 return py::none();
              })
         .def("__len__", &SyntaxNode::getChildCount)
         .def(
@@ -196,6 +279,13 @@ void registerSyntax(py::module_& m) {
                  return fmt::format("SyntaxNode(SyntaxKind.{})", toString(self.kind));
              })
         .def("__str__", &SyntaxNode::toString);
+
+    py::class_<IncludeMetadata>(m, "IncludeMetadata")
+        .def(py::init<>())
+        .def_readonly("syntax", &IncludeMetadata::syntax)
+        .def_readonly("path", &IncludeMetadata::path)
+        .def_readonly("buffer", &IncludeMetadata::buffer)
+        .def_readonly("isSystem", &IncludeMetadata::isSystem);
 
     py::class_<SyntaxTree, std::shared_ptr<SyntaxTree>>(m, "SyntaxTree")
         .def_readonly("isLibraryUnit", &SyntaxTree::isLibraryUnit)
@@ -216,7 +306,7 @@ void registerSyntax(py::module_& m) {
                     throw fs::filesystem_error("", path, result.error().first);
                 return *result;
             },
-            "path"_a, "sourceManager"_a, "options"_a = Bag())
+            py::keep_alive<0, 2>(), "path"_a, "sourceManager"_a, "options"_a = Bag())
         .def_static(
             "fromFiles",
             [](std::span<const std::string_view> paths) {
@@ -235,7 +325,7 @@ void registerSyntax(py::module_& m) {
                     throw fs::filesystem_error("", result.error().second, result.error().first);
                 return *result;
             },
-            "paths"_a, "sourceManager"_a, "options"_a = Bag())
+            py::keep_alive<0, 2>(), "paths"_a, "sourceManager"_a, "options"_a = Bag())
         .def_static("fromText",
                     py::overload_cast<std::string_view, std::string_view, std::string_view>(
                         &SyntaxTree::fromText),
@@ -244,25 +334,30 @@ void registerSyntax(py::module_& m) {
                     py::overload_cast<std::string_view, SourceManager&, std::string_view,
                                       std::string_view, const Bag&, const SourceLibrary*>(
                         &SyntaxTree::fromText),
+                    py::keep_alive<0, 2>(), "text"_a, "sourceManager"_a, "name"_a = "source",
+                    "path"_a = "", "options"_a = Bag(), "library"_a = nullptr)
+        .def_static("fromFileInMemory", &SyntaxTree::fromFileInMemory, py::keep_alive<0, 2>(),
                     "text"_a, "sourceManager"_a, "name"_a = "source", "path"_a = "",
-                    "options"_a = Bag(), "library"_a = nullptr)
-        .def_static("fromFileInMemory", &SyntaxTree::fromFileInMemory, "text"_a, "sourceManager"_a,
-                    "name"_a = "source", "path"_a = "", "options"_a = Bag())
-        .def_static("fromBuffer", &SyntaxTree::fromBuffer, "buffer"_a, "sourceManager"_a,
-                    "options"_a = Bag(), "inheritedMacros"_a = SyntaxTree::MacroList{})
-        .def_static("fromBuffers", &SyntaxTree::fromBuffers, "buffers"_a, "sourceManager"_a,
-                    "options"_a = Bag(), "inheritedMacros"_a = SyntaxTree::MacroList{})
-        .def_static("fromLibraryMapFile", &SyntaxTree::fromLibraryMapFile, "path"_a,
-                    "sourceManager"_a, "options"_a = Bag())
-        .def_static("fromLibraryMapText", &SyntaxTree::fromLibraryMapText, "text"_a,
-                    "sourceManager"_a, "name"_a = "source", "path"_a = "", "options"_a = Bag())
-        .def_static("fromLibraryMapBuffer", &SyntaxTree::fromLibraryMapBuffer, "buffer"_a,
-                    "sourceManager"_a, "options"_a = Bag())
+                    "options"_a = Bag())
+        .def_static("fromBuffer", &SyntaxTree::fromBuffer, py::keep_alive<0, 2>(), "buffer"_a,
+                    "sourceManager"_a, "options"_a = Bag(),
+                    "inheritedMacros"_a = SyntaxTree::MacroList{})
+        .def_static("fromBuffers", &SyntaxTree::fromBuffers, py::keep_alive<0, 2>(), "buffers"_a,
+                    "sourceManager"_a, "options"_a = Bag(),
+                    "inheritedMacros"_a = SyntaxTree::MacroList{})
+        .def_static("fromLibraryMapFile", &SyntaxTree::fromLibraryMapFile, py::keep_alive<0, 2>(),
+                    "path"_a, "sourceManager"_a, "options"_a = Bag())
+        .def_static("fromLibraryMapText", &SyntaxTree::fromLibraryMapText, py::keep_alive<0, 2>(),
+                    "text"_a, "sourceManager"_a, "name"_a = "source", "path"_a = "",
+                    "options"_a = Bag())
+        .def_static("fromLibraryMapBuffer", &SyntaxTree::fromLibraryMapBuffer,
+                    py::keep_alive<0, 2>(), "buffer"_a, "sourceManager"_a, "options"_a = Bag())
         .def_property_readonly("diagnostics", &SyntaxTree::diagnostics)
         .def_property_readonly("sourceManager", py::overload_cast<>(&SyntaxTree::sourceManager))
         .def_property_readonly("root", py::overload_cast<>(&SyntaxTree::root))
         .def_property_readonly("options", &SyntaxTree::options)
         .def_property_readonly("sourceLibrary", &SyntaxTree::getSourceLibrary)
+        .def("getIncludeDirectives", &SyntaxTree::getIncludeDirectives)
         .def_static("getDefaultSourceManager", &SyntaxTree::getDefaultSourceManager, byref);
 
     py::class_<LexerOptions>(m, "LexerOptions")
@@ -287,7 +382,7 @@ void registerSyntax(py::module_& m) {
 
     py::class_<SyntaxPrinter>(m, "SyntaxPrinter")
         .def(py::init<>())
-        .def(py::init<const SourceManager&>(), "sourceManager"_a)
+        .def(py::init<const SourceManager&>(), py::keep_alive<1, 2>(), "sourceManager"_a)
         .def("append", &SyntaxPrinter::append, byrefint, "text"_a)
         .def("print", py::overload_cast<Trivia>(&SyntaxPrinter::print), byrefint, "trivia"_a)
         .def("print", py::overload_cast<Token>(&SyntaxPrinter::print), byrefint, "token"_a)
@@ -305,4 +400,17 @@ void registerSyntax(py::module_& m) {
         .def("setSquashNewlines", &SyntaxPrinter::setSquashNewlines, byrefint, "include"_a)
         .def("str", &SyntaxPrinter::str)
         .def_static("printFile", &SyntaxPrinter::printFile, "tree"_a);
+
+    py::class_<PySyntaxRewriter>(m, "SyntaxRewriter")
+        .def("remove", &PySyntaxRewriter::py_remove)
+        .def("replace", &PySyntaxRewriter::py_replace)
+        .def("insert_before", &PySyntaxRewriter::py_insertBefore)
+        .def("insert_after", &PySyntaxRewriter::py_insertAfter)
+        .def("insert_at_front", &PySyntaxRewriter::py_insertAtFront, py::arg("list"),
+             py::arg("newNode"), py::arg("separator") = Token())
+        .def("insert_at_back", &PySyntaxRewriter::py_insertAtBack, py::arg("list"),
+             py::arg("newNode"), py::arg("separator") = Token())
+        .def_property_readonly("factory", &PySyntaxRewriter::getFactory);
+
+    m.def("rewrite", &pySyntaxRewrite, py::arg("tree"), py::arg("handler"));
 }

@@ -11,6 +11,7 @@ add_executable(
   OnlyAssignedOnResetTest.cpp
   RegisterHasNoResetTest.cpp
   NoLatchesOnDesignTest.cpp
+  EnforcePortPrefixTest.cpp
   EnforcePortSuffixTest.cpp
   NoOldAlwaysSyntaxTest.cpp
   AlwaysCombNonBlockingTest.cpp
@@ -26,7 +27,9 @@ add_executable(
   NoDotVarInPortConnectionTest.cpp
   NoLegacyGenerateTest.cpp
   AlwaysFFAssignmentOutsideConditionalTest.cpp
-  UnusedSensitiveSignalTest.cpp)
+  UnusedSensitiveSignalTest.cpp
+  PrintConfigTest.cpp
+  UndrivenRangeTest.cpp)
 
 target_link_libraries(tidy_unittests PRIVATE Catch2::Catch2 slang_tidy_obj_lib)
 target_compile_definitions(tidy_unittests PRIVATE UNITTESTS)

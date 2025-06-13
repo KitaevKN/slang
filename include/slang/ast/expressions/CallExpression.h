@@ -82,11 +82,15 @@ public:
     /// @returns the kind of subroutine being called.
     SubroutineKind getSubroutineKind() const;
 
+    /// @returns the known system name for the subroutine, if it's a built-in subroutine.
+    parsing::KnownSystemName getKnownSystemName() const;
+
     /// @returns true if the called subroutine has output (or inout / ref) arguments.
     bool hasOutputArgs() const;
 
     ConstantValue evalImpl(EvalContext& context) const;
     std::optional<bitwidth_t> getEffectiveWidthImpl() const;
+    EffectiveSign getEffectiveSignImpl(bool isForConversion) const;
 
     void serializeTo(ASTSerializer& serializer) const;
 
@@ -126,7 +130,7 @@ public:
     static bool bindArgs(const syntax::ArgumentListSyntax* argSyntax,
                          std::span<const FormalArgumentSymbol* const> formalArgs,
                          std::string_view symbolName, SourceRange range, const ASTContext& context,
-                         SmallVectorBase<const Expression*>& boundArgs, bool isBuiltInMethod);
+                         SmallVectorBase<const Expression*>& boundArgs);
 
     static bool isKind(ExpressionKind kind) { return kind == ExpressionKind::Call; }
 

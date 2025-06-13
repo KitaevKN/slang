@@ -15,6 +15,7 @@
 #include "slang/ast/Compilation.h"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/Expression.h"
+#include "slang/ast/LSPUtilities.h"
 #include "slang/ast/TimingControl.h"
 #include "slang/ast/expressions/AssignmentExpressions.h"
 #include "slang/ast/expressions/MiscExpressions.h"
@@ -199,7 +200,7 @@ ModportPortSymbol& ModportPortSymbol::fromSyntax(const ASTContext& context,
 
     // Perform checking on the connected symbol to make sure it's allowed
     // given the modport's direction.
-    ASTContext checkCtx = context.resetFlags(ASTFlags::NonProcedural | ASTFlags::NotADriver);
+    ASTContext checkCtx = context.resetFlags(ASTFlags::NonProcedural);
     if (direction != ArgumentDirection::In) {
         checkCtx.flags |= ASTFlags::LValue;
         if (direction == ArgumentDirection::InOut)
@@ -207,7 +208,7 @@ ModportPortSymbol& ModportPortSymbol::fromSyntax(const ASTContext& context,
     }
 
     auto loc = result->location;
-    auto& expr = ValueExpressionBase::fromSymbol(checkCtx, *result->internalSymbol, false,
+    auto& expr = ValueExpressionBase::fromSymbol(checkCtx, *result->internalSymbol, nullptr,
                                                  {loc, loc + result->name.length()});
 
     Expression::checkConnectionDirection(expr, direction, checkCtx, loc);
@@ -219,7 +220,7 @@ ModportPortSymbol& ModportPortSymbol::fromSyntax(const ASTContext& context,
 ModportPortSymbol& ModportPortSymbol::fromSyntax(const ASTContext& parentContext,
                                                  ArgumentDirection direction,
                                                  const ModportExplicitPortSyntax& syntax) {
-    ASTContext context = parentContext.resetFlags(ASTFlags::NonProcedural | ASTFlags::NotADriver);
+    ASTContext context = parentContext.resetFlags(ASTFlags::NonProcedural);
     auto& comp = context.getCompilation();
     auto name = syntax.name;
     auto result = comp.emplace<ModportPortSymbol>(name.valueText(), name.location(), direction);
@@ -338,6 +339,9 @@ void ModportSymbol::fromSyntax(const ASTContext& context, const ModportDeclarati
                         modport->hasExports = true;
 
                     for (auto subPort : portList.ports) {
+                        if (subPort->previewNode)
+                            modport->addMembers(*subPort->previewNode);
+
                         switch (subPort->kind) {
                             case SyntaxKind::ModportNamedPort: {
                                 auto& mps = MethodPrototypeSymbol::fromSyntax(
@@ -678,8 +682,8 @@ static void reduceComparison(const BinaryExpression& expr, Diagnostic& result) {
 
     auto opToken = syntax->as<BinaryExpressionSyntax>().operatorToken;
 
-    auto lc = expr.left().constant;
-    auto rc = expr.right().constant;
+    auto lc = expr.left().getConstant();
+    auto rc = expr.right().getConstant();
     SLANG_ASSERT(lc && rc);
 
     auto& note = result.addNote(diag::NoteComparisonReduces, opToken.location());
@@ -690,9 +694,9 @@ static void reduceComparison(const BinaryExpression& expr, Diagnostic& result) {
 void ElabSystemTaskSymbol::reportStaticAssert(const Scope& scope, SourceLocation loc,
                                               std::string_view message,
                                               const Expression* condition) {
-    if (condition && condition->constant) {
+    if (condition && condition->getConstant()) {
         // Issue no diagnostic if the assert condition is true.
-        if (condition->constant->isTrue())
+        if (condition->getConstant()->isTrue())
             return;
     }
 
@@ -712,6 +716,9 @@ void ElabSystemTaskSymbol::issueDiagnostic() const {
     if (!msg)
         return;
 
+    if (scope->isUninstantiated())
+        return;
+
     DiagCode code;
     switch (taskKind) {
         case ElabSystemTaskKind::Fatal:
@@ -729,8 +736,6 @@ void ElabSystemTaskSymbol::issueDiagnostic() const {
         case ElabSystemTaskKind::StaticAssert:
             reportStaticAssert(*scope, location, *msg, assertCondition);
             return;
-        default:
-            SLANG_UNREACHABLE;
     }
 
     scope->addDiag(code, location).addStringAllowEmpty(std::string(*msg));
@@ -766,21 +771,70 @@ void PrimitivePortSymbol::serializeTo(ASTSerializer& serializer) const {
 // Each 'bit' is one input value in the row.
 class BitTrie {
 public:
-    // Tries to insert the row. Returns nullptr if the row is
-    // successfully inserted, and a pointer to the previously
-    // inserted row with the same bit pattern if a collision
-    // is found.
-    template<typename TAllocator>
-    const UdpEntrySyntax* insert(const UdpEntrySyntax& syntax, std::span<const char> inputs,
-                                 char stateChar, TAllocator& allocator) {
-        SmallVector<BitTrie*> nodes;
-        BitTrie* primary = this;
-        nodes.push_back(this);
+    // Determines whether the trie contains at least one row that
+    // matches the given inputs (and possibly state char).
+    bool contains(std::span<const char> inputs, char stateChar) const {
+        auto handle = [](const BitTrie& node, SmallVector<const BitTrie*>& nextNodes, int index,
+                         bool) {
+            if (node.children[index])
+                nextNodes.push_back(node.children[index]);
+        };
 
+        SmallVector<const BitTrie*> nodes;
+        nodes.push_back(this);
+        traverse(nodes, inputs, stateChar, handle);
+
+        return std::ranges::any_of(nodes, [](auto node) { return node->entry != nullptr; });
+    }
+
+    // Inserts the given row into the trie. The provided results vector will
+    // be filled with all existing rows that match the new one we're inserting.
+    template<typename TAllocator>
+    void insert(const UdpEntrySyntax& syntax, std::span<const char> inputs, char stateChar,
+                TAllocator& allocator, SmallVector<const UdpEntrySyntax*>& results) {
+        BitTrie* primaryNode = this;
+        auto handle = [&primaryNode, &allocator](const BitTrie& constNode,
+                                                 SmallVector<BitTrie*>& nextNodes, int index,
+                                                 bool primary) {
+            // If we are handling a primary and the current node is also
+            // the primary node we should allocate if missing, otherwise
+            // we only add if it already exists.
+            BitTrie& node = const_cast<BitTrie&>(constNode);
+            if (primary && primaryNode == &node) {
+                if (!node.children[index])
+                    node.children[index] = allocator.emplace();
+                primaryNode = node.children[index];
+            }
+
+            if (node.children[index])
+                nextNodes.push_back(node.children[index]);
+        };
+
+        SmallVector<BitTrie*> nodes;
+        nodes.push_back(this);
+        traverse(nodes, inputs, stateChar, handle);
+
+        for (auto node : nodes) {
+            if (node->entry)
+                results.push_back(node->entry);
+        }
+
+        // Store the provided row so as not to miss info in case of possible overlap.
+        // If the primary->entry already has a value, then rewriting will not spoil
+        // anything, since the rewriting will be to the equivalent grammar.
+        primaryNode->entry = &syntax;
+    }
+
+private:
+    // Walks the provided input string (and optional state char) and invokes the
+    // given callback on all relevant nodes.
+    template<typename TNode, typename TCallback>
+    void traverse(SmallVector<TNode*>& nodes, std::span<const char> inputs, char stateChar,
+                  TCallback&& callback) const {
         auto advance = [&](char c) {
-            SmallVector<BitTrie*> nextNodes;
+            SmallVector<TNode*> nextNodes;
             for (auto node : nodes)
-                node->nextNodesFor(c, nextNodes, primary, allocator);
+                node->nextNodesFor(c, nextNodes, callback);
             nodes = std::move(nextNodes);
         };
 
@@ -808,14 +862,13 @@ public:
                     advance('0');
                     break;
                 case 'p':
-                case 'n': {
-                    // Special handling for iteration of edge specifiers.
-                    SmallVector<BitTrie*> nextNodes;
-                    for (auto node : nodes)
-                        node->nextNodesForEdge(c, nextNodes, primary, allocator);
-                    nodes = std::move(nextNodes);
+                    advance('6');
+                    advance('7');
                     break;
-                }
+                case 'n':
+                    advance('7');
+                    advance('6');
+                    break;
                 default:
                     break;
             }
@@ -824,43 +877,18 @@ public:
         // Include the state field if present.
         if (stateChar)
             advance(stateChar);
-
-        // If any of our nodes have entries we won't insert,
-        // as it means we have a duplicate.
-        for (auto node : nodes) {
-            if (node->entry)
-                return node->entry;
-        }
-
-        // If we have an empty node set we saw an error somewhere,
-        // in which case don't insert. Otherwise we've found the
-        // correct place to insert, pointed to by the primary.
-        if (!nodes.empty())
-            primary->entry = &syntax;
-        return nullptr;
     }
 
-private:
-    template<typename TAllocator>
-    void nextNodesFor(char c, SmallVector<BitTrie*>& nextNodes, BitTrie*& primaryNode,
-                      TAllocator& allocator) {
+    // Maps the given character to one or more of our child indices,
+    // invoking the provided callback for each one.
+    template<typename TNode, typename TCallback>
+    void nextNodesFor(char c, SmallVector<TNode*>& nextNodes, TCallback&& callback) const {
         // Map the character to one or more of our child entries.
         // The "primary" entry is the one that directly matches the
         // character, and there can be several secondary entries that
         // can match based on wildcard values.
-        //
-        // If we are handling a primary and the current node is also
-        // the primary node we should allocate if missing, otherwise
-        // we only add if it already exists.
         auto handle = [&](int index, bool primary = false) {
-            if (primary && primaryNode == this) {
-                if (!children[index])
-                    children[index] = allocator.emplace();
-                primaryNode = children[index];
-            }
-
-            if (children[index])
-                nextNodes.push_back(children[index]);
+            callback(*this, nextNodes, index, primary);
         };
 
         switch (c) {
@@ -868,15 +896,19 @@ private:
                 handle(0, true);
                 handle(3);
                 handle(4);
+                handle(6);
                 break;
             case '1':
                 handle(1, true);
                 handle(3);
                 handle(4);
+                handle(7);
                 break;
             case 'x':
                 handle(2, true);
                 handle(3);
+                handle(6);
+                handle(7);
                 break;
             case '?':
                 handle(3, true);
@@ -884,6 +916,8 @@ private:
                 handle(1);
                 handle(2);
                 handle(4);
+                handle(6);
+                handle(7);
                 break;
             case 'b':
                 handle(4, true);
@@ -899,6 +933,22 @@ private:
             case 'n':
                 handle(5, true);
                 break;
+            // Below are implicit node identifiers that cannot be found in the UDP grammar. They are
+            // helpers for `p` and `n`.
+            case '6':
+                // Handling `0` or `x`.
+                handle(6, true);
+                handle(0);
+                handle(2);
+                handle(3);
+                break;
+            case '7':
+                // Handling `1` or `x` (for `p` and `n` matching cases).
+                handle(7, true);
+                handle(1);
+                handle(2);
+                handle(3);
+                break;
             default:
                 // On error clear all nodes. Assume someone else
                 // (the parser) has reported the error already.
@@ -907,41 +957,7 @@ private:
         }
     }
 
-    template<typename TAllocator>
-    void nextNodesForEdge(char c, SmallVector<BitTrie*>& nextNodes, BitTrie*& primaryNode,
-                          TAllocator& allocator) {
-        SmallVector<BitTrie*> results;
-        auto handle = [&](char first, char second) {
-            // We have to do this in two steps when expanding the edge char.
-            BitTrie* unused = nullptr;
-            SmallVector<BitTrie*> temp;
-            nextNodesFor(first, temp, primaryNode, allocator);
-            for (auto node : temp) {
-                for (char d : {second, 'x'})
-                    node->nextNodesFor(d, results, d == second ? primaryNode : unused, allocator);
-            }
-
-            temp.clear();
-            nextNodesFor('x', temp, unused, allocator);
-            for (auto node : temp)
-                node->nextNodesFor(second, results, unused, allocator);
-        };
-
-        if (c == 'p')
-            handle('0', '1');
-        else
-            handle('1', '0');
-
-        // We have to de-dup now because we iterated multiple times
-        // for the same slot.
-        SmallSet<BitTrie*, 4> set;
-        for (auto node : results) {
-            if (set.emplace(node).second)
-                nextNodes.push_back(node);
-        }
-    }
-
-    BitTrie* children[6] = {};
+    BitTrie* children[8] = {};
     const UdpEntrySyntax* entry = nullptr;
 };
 
@@ -952,8 +968,10 @@ static void createTableRow(const Scope& scope, const UdpEntrySyntax& syntax,
     SmallVector<char> inputs;
     size_t numInputs = 0;
     bool allX = true;
+    bool isEdgeSensitive = false;
     for (auto input : syntax.inputs) {
         if (input->kind == SyntaxKind::UdpEdgeField) {
+            isEdgeSensitive = true;
             auto& edge = input->as<UdpEdgeFieldSyntax>();
             inputs.push_back('(');
 
@@ -993,6 +1011,18 @@ static void createTableRow(const Scope& scope, const UdpEntrySyntax& syntax,
             auto tok = input->as<UdpSimpleFieldSyntax>().field;
             for (auto c : tok.rawText()) {
                 auto d = charToLower(c);
+                switch (d) {
+                    case '*':
+                    case 'r':
+                    case 'f':
+                    case 'p':
+                    case 'n':
+                        isEdgeSensitive = true;
+                        break;
+                    default:
+                        break;
+                }
+
                 inputs.push_back(d);
                 numInputs++;
                 allX &= d == 'x';
@@ -1076,18 +1106,21 @@ static void createTableRow(const Scope& scope, const UdpEntrySyntax& syntax,
         }
     };
 
-    auto existing = trie.insert(syntax, inputs, stateChar, trieAlloc);
-    if (existing) {
-        // This is an error if the existing row has a different output,
-        // otherwise it's just silently ignored.
-        auto existingOutput = getOutputChar(existing->next);
-        auto existingState = getStateChar(existing->current);
-        if (!(existingOutput == outputChar ||
-              matchOutput(existingState, existingOutput, outputChar) ||
-              matchOutput(stateChar, outputChar, existingOutput))) {
-            auto& diag = scope.addDiag(diag::UdpDupDiffOutput, syntax.sourceRange());
-            diag.addNote(diag::NotePreviousDefinition, existing->sourceRange());
-            return;
+    SmallVector<const UdpEntrySyntax*> conflicts;
+    trie.insert(syntax, inputs, stateChar, trieAlloc, conflicts);
+    if (!conflicts.empty()) {
+        for (const auto* existing : conflicts) {
+            // This is an error if the existing row has a different output,
+            // otherwise it's just silently ignored.
+            auto existingOutput = getOutputChar(existing->next);
+            auto existingState = getStateChar(existing->current);
+            if (existingOutput != outputChar &&
+                !matchOutput(existingState, existingOutput, outputChar) &&
+                !matchOutput(stateChar, outputChar, existingOutput)) {
+                auto& diag = scope.addDiag(diag::UdpDupDiffOutput, syntax.sourceRange());
+                diag.addNote(diag::NotePreviousDefinition, existing->sourceRange());
+                return;
+            }
         }
     }
     else if (allX && outputChar != 'x') {
@@ -1096,7 +1129,111 @@ static void createTableRow(const Scope& scope, const UdpEntrySyntax& syntax,
     }
 
     auto inputSpan = inputs.copy(scope.getCompilation());
-    table.push_back({std::string_view(inputSpan.data(), inputSpan.size()), stateChar, outputChar});
+    table.push_back({std::string_view(inputSpan.data(), inputSpan.size()), stateChar, outputChar,
+                     isEdgeSensitive});
+}
+
+const static std::vector<std::string_view> AllPrimEdges = {"(01)", "(0x)", "(10)",
+                                                           "(1x)", "(x0)", "(x1)"};
+
+static void checkPrimitiveEdgeCombinations(const PrimitiveSymbol& prim, const Scope& scope,
+                                           const BitTrie& trie) {
+    // Check that if the behavior of the UDP is sensitive to edges of any input, the desired
+    // output state shall be specified for all edges of all inputs.
+    if (!prim.isEdgeSensitive || prim.table.empty())
+        return;
+
+    SLANG_ASSERT(prim.ports.size() >= 2);
+    auto numInputs = prim.ports.size() - 1;
+
+    // Initial state is (01)000...
+    std::string state(AllPrimEdges[0]);
+    state.append(numInputs - 1, '0');
+
+    // End state is xxx...(x1)
+    std::string endState(numInputs - 1, 'x');
+    endState.append("(x1)"sv);
+
+    // Try to find the missing combinations by completely enumerating all
+    // possible table rows.
+    std::string noteStr;
+    uint32_t noteCount = 0;
+    Diagnostic* diag = nullptr;
+    auto& comp = scope.getCompilation();
+
+    while (true) {
+        // Try to find the desired row in the trie we built earlier.
+        if (!trie.contains(state, '?')) {
+            // Not found, so we'll issue a warning if we don't have one already.
+            if (!diag)
+                diag = &scope.addDiag(diag::UdpCoverage, prim.location);
+
+            if (noteCount >= comp.getOptions().maxUDPCoverageNotes) {
+                noteStr += "...and more\n";
+                break;
+            }
+
+            bool nextSplit = true;
+            for (auto c : state) {
+                if (c == '(')
+                    nextSplit = false;
+                else if (c == ')')
+                    nextSplit = true;
+
+                noteStr += c;
+                if (nextSplit)
+                    noteStr += ' ';
+            }
+            noteCount++;
+            noteStr += '\n';
+        }
+
+        if (state.back() == ')' && state == endState)
+            break;
+
+        // Iterate state by increasing leftoutermost inputs.
+        // For simple inputs value '0' goes to '1' and value '1' goes to `x`.
+        // For edge inputs circular iteration occurs over 'AllPrimEdges' list.
+        for (size_t i = 0; i < state.size(); ++i) {
+            if (state[i] == '(') {
+                std::string_view currEdge(&state[i], 4);
+                if (currEdge == AllPrimEdges.back()) {
+                    // We finished cycling this edge.
+                    if (state.back() != 'x') {
+                        state.replace(i, 4, AllPrimEdges[0]);
+                        i += 3;
+                        continue;
+                    }
+
+                    // Move edge input to the next position and set all others as '0'
+                    std::ranges::fill(state, '0');
+                    state.replace(i + 1, 4, AllPrimEdges[0]);
+                    break;
+                }
+
+                auto it = std::find(AllPrimEdges.begin(), AllPrimEdges.end(), currEdge) + 1;
+                state.replace(i, 4, *it);
+                break;
+            }
+
+            if (state[i] == '0') {
+                state[i] = '1';
+                break;
+            }
+
+            if (state[i] == '1') {
+                state[i] = 'x';
+                break;
+            }
+
+            state[i] = '0';
+        }
+    }
+
+    if (diag && !noteStr.empty()) {
+        noteStr.pop_back();
+        diag->addNote(diag::NoteUdpCoverage, SourceLocation::NoLocation) << noteStr;
+    }
 }
 
 PrimitiveSymbol& PrimitiveSymbol::fromSyntax(const Scope& scope,
@@ -1266,6 +1403,7 @@ PrimitiveSymbol& PrimitiveSymbol::fromSyntax(const Scope& scope,
         return *prim;
     }
 
+    prim->ports = ports.copy(comp);
     if (ports.size() < 2)
         scope.addDiag(diag::PrimitiveTwoPorts, prim->location);
     else if (ports[0]->direction == PrimitivePortDirection::In)
@@ -1321,11 +1459,11 @@ PrimitiveSymbol& PrimitiveSymbol::fromSyntax(const Scope& scope,
                 if (expr.kind == ExpressionKind::IntegerLiteral &&
                     (expr.type->getBitWidth() == 1 || expr.isUnsizedInteger())) {
                     context.eval(expr);
-                    if (expr.constant) {
-                        auto& val = expr.constant->integer();
+                    if (expr.getConstant()) {
+                        auto& val = expr.getConstant()->integer();
                         if (val == 0 || val == 1 ||
                             (val.getBitWidth() == 1 && exactlyEqual(val[0], logic_t::x))) {
-                            prim->initVal = expr.constant;
+                            prim->initVal = expr.getConstant();
                         }
                     }
                 }
@@ -1339,13 +1477,16 @@ PrimitiveSymbol& PrimitiveSymbol::fromSyntax(const Scope& scope,
         BumpAllocator alloc;
         PoolAllocator<BitTrie> trieAlloc(alloc);
         SmallVector<TableEntry> table;
-        for (auto entry : syntax.body->entries)
+        for (auto entry : syntax.body->entries) {
             createTableRow(scope, *entry, table, ports.size(), trie, trieAlloc);
+            if (!table.empty() && !prim->isEdgeSensitive)
+                prim->isEdgeSensitive = table.back().isEdgeSensitive;
+        }
 
         prim->table = table.copy(comp);
+        checkPrimitiveEdgeCombinations(*prim, scope, trie);
     }
 
-    prim->ports = ports.copy(comp);
     return *prim;
 }
 
@@ -1389,6 +1530,9 @@ void AssertionPortSymbol::buildPorts(Scope& scope, const AssertionItemPortListSy
     std::optional<ArgumentDirection> lastDir;
 
     for (auto item : syntax.ports) {
+        if (item->previewNode)
+            scope.addMembers(*item->previewNode);
+
         auto port = comp.emplace<AssertionPortSymbol>(item->name.valueText(),
                                                       item->name.location());
         port->setSyntax(*item);
@@ -1577,6 +1721,9 @@ CheckerSymbol& CheckerSymbol::fromSyntax(const Scope& scope,
         ArgumentDirection lastDir = ArgumentDirection::In;
 
         for (auto item : syntax.portList->ports) {
+            if (item->previewNode)
+                result->addMembers(*item->previewNode);
+
             auto port = comp.emplace<AssertionPortSymbol>(item->name.valueText(),
                                                           item->name.location());
             port->setSyntax(*item);
@@ -1789,6 +1936,9 @@ RandSeqProductionSymbol& RandSeqProductionSymbol::fromSyntax(const Scope& scope,
     }
 
     for (auto rule : syntax.rules) {
+        if (rule->previewNode)
+            result->addMembers(*rule->previewNode);
+
         auto& ruleBlock = StatementBlockSymbol::fromSyntax(*result, *rule);
         result->addMember(ruleBlock);
     }
@@ -1843,7 +1993,7 @@ RandSeqProductionSymbol::ProdItem RandSeqProductionSymbol::createProdItem(
 
     SmallVector<const Expression*> args;
     CallExpression::bindArgs(syntax.argList, symbol->arguments, symbol->name, syntax.sourceRange(),
-                             context, args, /* isBuiltInMethod */ false);
+                             context, args);
 
     return ProdItem(symbol, args.copy(context.getCompilation()));
 }
@@ -2144,8 +2294,6 @@ void RandSeqProductionSymbol::serializeTo(ASTSerializer& serializer) const {
                     serializer.endArray();
                     break;
                 }
-                default:
-                    SLANG_UNREACHABLE;
             }
             serializer.endObject();
         }
@@ -2210,12 +2358,21 @@ NetAliasSymbol& NetAliasSymbol::fromSyntax(const ASTContext& parentContext,
     return *result;
 }
 
+struct NetAlias {
+    not_null<const ValueSymbol*> sym;
+    not_null<const Expression*> expr;
+    Compilation::AliasBitRange bounds;
+};
+
 struct NetAliasVisitor {
     const ASTContext& context;
     const NetType* commonNetType = nullptr;
+    SmallVector<NetAlias> netAliases;
+    EvalContext& evalCtx;
     bool issuedError = false;
 
-    NetAliasVisitor(const ASTContext& context) : context(context) {}
+    NetAliasVisitor(const ASTContext& context, EvalContext& evalCtx) :
+        context(context), evalCtx(evalCtx) {}
 
     template<typename T>
     void visit(const T& expr) {
@@ -2230,7 +2387,13 @@ struct NetAliasVisitor {
                             context.addDiag(diag::NetAliasNotANet, expr.sourceRange) << sym->name;
                         }
                         else {
-                            auto& nt = sym->template as<NetSymbol>().netType;
+                            auto& netSym = sym->template as<NetSymbol>();
+                            if (auto bounds = LSPUtilities::getBounds(expr, evalCtx,
+                                                                      netSym.getType())) {
+                                netAliases.push_back({&netSym, &expr, *bounds});
+                            }
+
+                            auto& nt = netSym.netType;
                             if (!commonNetType) {
                                 commonNetType = &nt;
                             }
@@ -2265,14 +2428,13 @@ std::span<const Expression* const> NetAliasSymbol::getNetReferences() const {
     auto syntax = getSyntax();
     SLANG_ASSERT(scope && syntax);
 
-    // TODO: there should be a global check somewhere that any given bit
-    // of a net isn't aliased to the same target signal bit multiple times.
+    SmallVector<const Expression*> buffer;
+    ASTContext context(*scope, LookupLocation::after(*this), ASTFlags::NonProcedural);
+    EvalContext evalCtx(context);
+    NetAliasVisitor visitor(context, evalCtx);
+    SmallVector<SmallVector<NetAlias>> netAliases;
     bitwidth_t bitWidth = 0;
     bool issuedError = false;
-    SmallVector<const Expression*> buffer;
-    ASTContext context(*scope, LookupLocation::after(*this),
-                       ASTFlags::NonProcedural | ASTFlags::NotADriver);
-    NetAliasVisitor visitor(context);
 
     for (auto exprSyntax : syntax->as<NetAliasSyntax>().nets) {
         auto& netRef = Expression::bind(*exprSyntax, context);
@@ -2290,9 +2452,80 @@ std::span<const Expression* const> NetAliasSymbol::getNetReferences() const {
 
         netRef.visit(visitor);
         buffer.push_back(&netRef);
+        if (!visitor.netAliases.empty()) {
+            netAliases.emplace_back(std::move(visitor.netAliases));
+            visitor.netAliases.clear();
+        }
     }
 
     netRefs = buffer.copy(scope->getCompilation());
+    if (issuedError || netAliases.empty())
+        return *netRefs;
+
+    // Compare every net alias expression to every other, finding the set of
+    // bits that overlap and adding drivers for them so that we can catch
+    // and report on duplicate and/or self aliases.
+    auto& comp = scope->getCompilation();
+    const size_t numAliases = netAliases.size();
+    for (size_t i = 0; i < numAliases - 1; i++) {
+        for (size_t j = i + 1; j < numAliases; j++) {
+            auto& first = netAliases[i];
+            auto& second = netAliases[j];
+            auto firstIt = first.begin();
+            auto firstEnd = first.end();
+            auto secondIt = second.begin();
+            auto secondEnd = second.end();
+
+            // Compare each net reference or selection from the left hand side
+            // to the corresponding elements on the right hand side. The individual
+            // elements can differ in width, so consume bits from the larger side
+            // and only advance when a side has been consumed.
+            std::optional<std::pair<DriverBitRange, bool>> remainder;
+            while (firstIt != firstEnd && secondIt != secondEnd) {
+                auto& firstAlias = *firstIt;
+                auto& secondAlias = *secondIt;
+                auto firstRange = firstAlias.bounds;
+                auto secondRange = secondAlias.bounds;
+
+                if (remainder) {
+                    if (remainder->second)
+                        firstRange = remainder->first;
+                    else
+                        secondRange = remainder->first;
+                    remainder.reset();
+                }
+
+                auto firstWidth = firstRange.second - firstRange.first + 1;
+                auto secondWidth = secondRange.second - secondRange.first + 1;
+
+                uint64_t width;
+                if (firstWidth < secondWidth) {
+                    width = firstWidth;
+                    remainder = std::pair(
+                        DriverBitRange(secondRange.first, secondRange.second - width), false);
+                    firstIt++;
+                }
+                else {
+                    width = secondWidth;
+                    secondIt++;
+
+                    if (firstWidth == secondWidth)
+                        firstIt++;
+                    else {
+                        remainder = std::pair(
+                            DriverBitRange(firstRange.first, firstRange.second - width), true);
+                    }
+                }
+
+                comp.noteNetAlias(*scope, *firstAlias.sym,
+                                  {firstRange.second - width + 1, firstRange.second},
+                                  *firstAlias.expr, *secondAlias.sym,
+                                  {secondRange.second - width + 1, secondRange.second},
+                                  *secondAlias.expr);
+            }
+        }
+    }
+
     return *netRefs;
 }
 

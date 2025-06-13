@@ -7,9 +7,11 @@
 #include "fmt/color.h"
 
 #include "slang/syntax/AllSyntax.h"
+#include "slang/syntax/SyntaxPrinter.h"
 
 using namespace slang;
 using namespace slang::ast;
+using namespace slang::syntax;
 
 namespace xilinx_do_not_care_values {
 struct MainVisitor : public TidyVisitor, ASTVisitor<MainVisitor, true, true> {
@@ -17,8 +19,9 @@ struct MainVisitor : public TidyVisitor, ASTVisitor<MainVisitor, true, true> {
 
     void handle(const IntegerLiteral& expr) {
         if (auto syntax = expr.syntax; syntax) {
-            bool hasDoNotCare = syntax->toString().find('?') != std::string::npos;
-            bool hasDecimal = syntax->toString().find('d') != std::string::npos;
+            auto strSyntax = SyntaxPrinter().setIncludeTrivia(false).print(*syntax).str();
+            bool hasDoNotCare = strSyntax.find('?') != std::string::npos;
+            bool hasDecimal = strSyntax.find('d') != std::string::npos;
 
             if (hasDoNotCare && hasDecimal)
                 diags.add(diag::XilinxDoNotCareValues, syntax->sourceRange());
@@ -31,9 +34,11 @@ using namespace xilinx_do_not_care_values;
 
 class XilinxDoNotCareValues : public TidyCheck {
 public:
-    explicit XilinxDoNotCareValues(TidyKind kind) : TidyCheck(kind) {}
+    explicit XilinxDoNotCareValues(TidyKind kind,
+                                   std::optional<slang::DiagnosticSeverity> severity) :
+        TidyCheck(kind, severity) {}
 
-    bool check(const RootSymbol& root) override {
+    bool check(const RootSymbol& root, const slang::analysis::AnalysisManager&) override {
         MainVisitor visitor(diagnostics);
         root.visit(visitor);
         return diagnostics.empty();
@@ -45,7 +50,7 @@ public:
         return "use of x'd? for do-not-care values is not recommended use x'b? instead";
     }
 
-    DiagnosticSeverity diagSeverity() const override { return DiagnosticSeverity::Warning; }
+    DiagnosticSeverity diagDefaultSeverity() const override { return DiagnosticSeverity::Warning; }
 
     std::string name() const override { return "XilinxDoNotCareValues"; }
 

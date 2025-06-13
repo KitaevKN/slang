@@ -20,10 +20,15 @@ target_sources(
           expressions/AssertionExpr.cpp
           expressions/AssignmentExpressions.cpp
           expressions/CallExpression.cpp
+          expressions/ConversionExpression.cpp
           expressions/LiteralExpressions.cpp
           expressions/MiscExpressions.cpp
+          expressions/Operator.cpp
           expressions/OperatorExpressions.cpp
           expressions/SelectExpressions.cpp
+          statements/ConditionalStatements.cpp
+          statements/LoopStatements.cpp
+          statements/MiscStatements.cpp
           symbols/AttributeSymbol.cpp
           symbols/BlockSymbols.cpp
           symbols/ClassSymbols.cpp
@@ -45,6 +50,7 @@ target_sources(
           types/TypePrinter.cpp
           types/Type.cpp
           ASTContext.cpp
+          ASTDiagMap.cpp
           ASTSerializer.cpp
           Bitstream.cpp
           Compilation.cpp
@@ -54,6 +60,7 @@ target_sources(
           FmtHelpers.cpp
           HierarchicalReference.cpp
           Lookup.cpp
+          LSPUtilities.cpp
           LValue.cpp
           OpaqueInstancePath.cpp
           Patterns.cpp
@@ -61,7 +68,7 @@ target_sources(
           ScriptSession.cpp
           SemanticFacts.cpp
           SFormat.cpp
-          Statements.cpp
+          Statement.cpp
           Symbol.cpp
           SystemSubroutine.cpp
           TimingControl.cpp)

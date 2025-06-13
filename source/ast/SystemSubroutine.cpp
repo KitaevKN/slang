@@ -19,18 +19,6 @@ namespace slang::ast {
 
 using namespace syntax;
 
-bool SystemSubroutine::allowEmptyArgument(size_t) const {
-    return false;
-}
-
-bool SystemSubroutine::allowClockingArgument(size_t) const {
-    return false;
-}
-
-bool SystemSubroutine::isArgUnevaluated(size_t) const {
-    return false;
-}
-
 const Expression& SystemSubroutine::bindArgument(size_t, const ASTContext& context,
                                                  const ExpressionSyntax& syntax,
                                                  const Args&) const {
@@ -73,16 +61,10 @@ ASTContext SystemSubroutine::unevaluatedContext(const ASTContext& sourceContext)
     return result;
 }
 
-// Wrapper around Expression::requireLValue that also registers the
-// target symbol as being assigned.
-bool SystemSubroutine::registerLValue(const Expression& expr, const ASTContext& context) {
-    if (!expr.requireLValue(context))
-        return false;
-
+// Helper method that registers the target symbol as being assigned.
+void SystemSubroutine::registerLValue(const Expression& expr, const ASTContext& context) {
     if (auto sym = expr.getSymbolReference())
         context.getCompilation().noteReference(*sym, /* isLValue */ true);
-
-    return true;
 }
 
 const Type& SystemSubroutine::badArg(const ASTContext& context, const Expression& arg) const {
@@ -125,8 +107,8 @@ const Type& SimpleSystemSubroutine::checkArguments(const ASTContext& context, co
     if (!checkArgCount(context, isMethod, args, range, requiredArgs, argTypes.size()))
         return comp.getErrorType();
 
-    if (isFirstArgLValue && !args.empty() && !registerLValue(*args[0], context))
-        return comp.getErrorType();
+    if (isFirstArgLValue && !args.empty())
+        registerLValue(*args[0], context);
 
     return *returnType;
 }

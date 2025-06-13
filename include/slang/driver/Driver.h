@@ -8,6 +8,7 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "slang/ast/Compilation.h"
 #include "slang/diagnostics/DiagnosticEngine.h"
 #include "slang/driver/SourceLoader.h"
 #include "slang/text/SourceManager.h"
@@ -18,8 +19,12 @@
 #include "slang/util/Util.h"
 
 namespace slang {
+
+class JsonDiagnosticClient;
+class JsonWriter;
 class TextDiagnosticClient;
-}
+
+} // namespace slang
 
 namespace slang::syntax {
 class SyntaxTree;
@@ -31,6 +36,13 @@ class Compilation;
 enum class CompilationFlags;
 
 } // namespace slang::ast
+
+namespace slang::analysis {
+
+class AnalysisManager;
+enum class AnalysisFlags;
+
+} // namespace slang::analysis
 
 namespace slang::driver {
 
@@ -48,13 +60,17 @@ namespace slang::driver {
 /// if (!driver.parseCommandLine(someStr)) { ...error }
 /// if (!driver.processOptions()) { ...error }
 /// if (!driver.parseAllSources()) { ...error }
-///
-/// auto compilation = driver.createCompilation();
-/// if (!driver.reportCompilation(*compilation)) { ...error }
+/// if (!driver.runFullCompilation()) { ...error }
 /// else { ...success }
 /// @endcode
 ///
 class SLANG_EXPORT Driver {
+private:
+    // This exists to ensure we get a Compilation object created prior to anything else,
+    // such as the DiagnosticEngine, which wants a Compilation to register callbacks
+    // for printing symbol paths.
+    ast::Compilation defaultComp;
+
 public:
     /// The command line object that will be used to parse
     /// arguments if the @a parseCommandLine method is called.
@@ -66,8 +82,11 @@ public:
     /// The diagnostics engine that will be used to report diagnostics.
     DiagnosticEngine diagEngine;
 
-    /// The diagnostics client that will be used to render diagnostics.
-    std::shared_ptr<TextDiagnosticClient> diagClient;
+    /// The text diagnostics client that will be used to render diagnostics.
+    std::shared_ptr<TextDiagnosticClient> textDiagClient;
+
+    /// The (optional) JSON diagnostics client that will be used to render diagnostics.
+    std::shared_ptr<JsonDiagnosticClient> jsonDiagClient;
 
     /// The object that handles loading and parsing source files.
     SourceLoader sourceLoader;
@@ -105,6 +124,9 @@ public:
 
         /// A set of preprocessor directives to be ignored.
         std::vector<std::string> ignoreDirectives;
+
+        /// A set of options controlling translate-off comment directives.
+        std::vector<std::string> translateOffOptions;
 
         /// @}
         /// @name Parsing
@@ -145,6 +167,10 @@ public:
 
         /// The maximum number of instances allowed in a single instance array.
         std::optional<uint32_t> maxInstanceArray;
+
+        /// The maximum number of UDP coverage notes that will be generated for a single
+        /// warning about missing edge transitions.
+        std::optional<uint32_t> maxUDPCoverageNotes;
 
         /// A string indicating a member of @a CompatMode to use for tailoring
         /// other compilation options.
@@ -202,9 +228,16 @@ public:
         /// If true, include macro expansion information in printed diagnostics.
         std::optional<bool> diagMacroExpansion;
 
+        /// If true, display absolute paths to files in printed diagnostics.
+        std::optional<bool> diagAbsPaths;
+
         /// One of the ShowHierarchyPathOption values that control whether to
         /// include hierarchy paths in printed diagnostics.
         std::optional<std::string> diagHierarchy;
+
+        /// If set, the path to a JSON file that will be written with diagnostic information.
+        /// Can be '-' to indicate that the JSON should be written to stdout.
+        std::optional<std::string> diagJson;
 
         /// The maximum number of errors to print before giving up.
         std::optional<uint32_t> errorLimit;
@@ -224,6 +257,19 @@ public:
         flat_hash_set<std::string> excludeExts;
 
         /// @}
+        /// @name Analysis
+        /// @{
+
+        /// A collection of flags that control analysis.
+        std::map<analysis::AnalysisFlags, std::optional<bool>> analysisFlags;
+
+        /// The maximum number of steps to take when analyzing a case statement.
+        std::optional<uint32_t> maxCaseAnalysisSteps;
+
+        /// The maximum number of steps to take when analyzing a loop statement.
+        std::optional<uint32_t> maxLoopAnalysisSteps;
+
+        /// @}
 
         /// Returns true if the lintMode option is provided.
         bool lintMode() const;
@@ -231,6 +277,7 @@ public:
 
     /// Constructs a new instance of the @a Driver class.
     Driver();
+    ~Driver();
 
     /// @brief Adds standard command line arguments to the @a cmdLine object.
     ///
@@ -291,6 +338,18 @@ public:
     /// Prints all macros from all loaded buffers to stdout.
     void reportMacros();
 
+    /// @brief Returns a list of all files that were loaded by the driver.
+    /// @param includesOnly If true, only include files that were loaded are returned.
+    std::vector<std::filesystem::path> getDepfiles(bool includesOnly = false) const;
+
+    /// @brief Serializes the given list of files into a depfile format.
+    /// @param files The list of files to serialize.
+    /// @param depfileTarget The target file to use; also implies that makefile format should be
+    /// used, with this string as the target. If not set, it will serialize in filelist format, with
+    /// one file per line.
+    std::string serializeDepfiles(const std::vector<std::filesystem::path>& files,
+                                  const std::optional<std::string>& depfileTarget);
+
     /// @brief Parses all loaded buffers into syntax trees and appends the resulting trees
     /// to the @a syntaxTrees list.
     ///
@@ -299,6 +358,9 @@ public:
 
     /// Creates an options bag from all of the currently set options.
     [[nodiscard]] Bag createOptionBag() const;
+
+    /// Creates an options bag from all of the currently set parse options
+    [[nodiscard]] Bag createParseOptionBag() const;
 
     /// Creates a compilation object from all of the current loaded state of the driver.
     [[nodiscard]] std::unique_ptr<ast::Compilation> createCompilation();
@@ -310,8 +372,26 @@ public:
     /// @brief Reports the result of compilation.
     ///
     /// If @a quiet is set to true, non-essential output will be suppressed.
+    void reportCompilation(ast::Compilation& compilation, bool quiet);
+
+    /// @brief Runs analysis on a compilation and reports the results.
+    ///
+    /// @note The compilation will be frozen after this call.
+    std::unique_ptr<analysis::AnalysisManager> runAnalysis(ast::Compilation& compilation);
+
+    /// @brief Reports all diagnostics to output.
+    ///
+    /// If @a quiet is set to true, non-essential output will be suppressed.
     /// @returns true if compilation succeeded and false if errors were encountered.
-    [[nodiscard]] bool reportCompilation(ast::Compilation& compilation, bool quiet);
+    [[nodiscard]] bool reportDiagnostics(bool quiet);
+
+    /// @brief Runs a full compilation pass and reports the results.
+    ///
+    /// This is a helper method that calls @a createCompilation, @a reportCompilation,
+    /// @a runAnalysis, and @a reportDiagnostics in sequence.
+    ///
+    /// @returns true if compilation succeeded and false if errors were encountered.
+    [[nodiscard]] bool runFullCompilation(bool quiet = false);
 
 private:
     bool parseUnitListing(std::string_view text);
@@ -324,6 +404,9 @@ private:
 
     bool anyFailedLoads = false;
     flat_hash_set<std::filesystem::path> activeCommandFiles;
+    std::vector<std::tuple<std::string_view, std::string_view, std::string_view>>
+        translateOffFormats;
+    std::unique_ptr<JsonWriter> jsonWriter;
 };
 
 } // namespace slang::driver

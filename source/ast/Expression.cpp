@@ -17,20 +17,22 @@
 #include "slang/syntax/AllSyntax.h"
 #include "slang/syntax/SyntaxVisitor.h"
 
-namespace {
+namespace slang::ast {
 
-using namespace slang;
-using namespace slang::ast;
+using namespace parsing;
+using namespace syntax;
 
-struct EvalVisitor {
+struct Expression::EvalVisitor {
     template<typename T>
     ConstantValue visit(const T& expr, EvalContext& context) {
-        if (expr.constant)
-            return *expr.constant;
+        if (expr.getConstant())
+            return *expr.getConstant();
 
         if (expr.bad()) {
-            if (context.cacheResults())
+            if (context.cacheResults()) {
+                SLANG_ASSERT(!context.getCompilation().isFrozen());
                 expr.constant = &ConstantValue::Invalid;
+            }
             return nullptr;
         }
 
@@ -49,8 +51,7 @@ struct EvalVisitor {
     }
 };
 
-class LValueVisitor {
-public:
+struct Expression::LValueVisitor {
     template<typename T>
     LValue visit(const T& expr, EvalContext& context) {
         if constexpr (requires { expr.evalLValueImpl(context); }) {
@@ -68,8 +69,7 @@ public:
     }
 };
 
-class EffectiveWidthVisitor {
-public:
+struct Expression::EffectiveWidthVisitor {
     template<typename T>
     std::optional<bitwidth_t> visit(const T& expr) {
         if constexpr (requires { expr.getEffectiveWidthImpl(); }) {
@@ -84,8 +84,7 @@ public:
     }
 };
 
-class EffectiveSignVisitor {
-public:
+struct Expression::EffectiveSignVisitor {
     using EffectiveSign = Expression::EffectiveSign;
 
     bool isForConversion;
@@ -106,7 +105,7 @@ public:
     }
 };
 
-struct HierarchicalVisitor {
+struct Expression::HierarchicalVisitor {
     bool any = false;
 
     template<typename T>
@@ -122,13 +121,6 @@ struct HierarchicalVisitor {
     }
 };
 
-} // namespace
-
-namespace slang::ast {
-
-using namespace parsing;
-using namespace syntax;
-
 // This visitor handles inserting implicit conversions into an expression
 // tree where necessary. SystemVerilog has an additional weird feature where
 // the type of one branch of an expression tree can bubble up and then propagate
@@ -138,12 +130,12 @@ struct Expression::PropagationVisitor {
     const Type& newType;
     const Expression* parentExpr;
     SourceRange opRange;
-    bool isAssignment;
+    ConversionKind conversionKind;
 
     PropagationVisitor(const ASTContext& context, const Type& newType, const Expression* parentExpr,
-                       SourceRange opRange, bool isAssignment) :
+                       SourceRange opRange, ConversionKind conversionKind) :
         context(context), newType(newType), parentExpr(parentExpr), opRange(opRange),
-        isAssignment(isAssignment) {}
+        conversionKind(conversionKind) {}
 
     template<typename T>
     Expression& visit(T& expr) {
@@ -160,28 +152,32 @@ struct Expression::PropagationVisitor {
         // check if the conversion should be pushed further down the tree. Otherwise we
         // should insert the implicit conversion here.
         bool needConversion = !newType.isEquivalent(*expr.type);
-        if constexpr (requires { expr.propagateType(context, newType, opRange); }) {
+        if constexpr (requires { expr.propagateType(context, newType, opRange, conversionKind); }) {
             if ((newType.isFloating() && expr.type->isFloating()) ||
                 (newType.isIntegral() && expr.type->isIntegral()) || newType.isString() ||
                 expr.kind == ExpressionKind::ValueRange) {
 
-                // If we don't need a conversion here we still need to call propagateType as
-                // one of our child expressions may still need conversion. However, we shouldn't
-                // pass along our given opRange since we didn't need the conversion here, so our
-                // parent operator isn't relevant. We should try to refigure an opRange for our
-                // most immediate parent expression instead.
-                if (!needConversion)
+                if (!needConversion) {
+                    // If we don't need a conversion here we still need to call propagateType as
+                    // one of our child expressions may still need conversion. However, we shouldn't
+                    // pass along our given opRange since we didn't need the conversion here, so our
+                    // parent operator isn't relevant. We should try to refigure an opRange for our
+                    // most immediate parent expression instead.
                     updateRange(expr);
+                }
 
-                if (expr.propagateType(context, newType, opRange))
+                if (expr.propagateType(context, newType, opRange, conversionKind)) {
+                    // We propagated the type successfully so we don't need a conversion.
+                    // We should however clear out any constant value that may have been
+                    // stored here, since it may no longer be valid given the new type.
                     needConversion = false;
+                    expr.constant = nullptr;
+                }
             }
         }
 
         Expression* result = &expr;
         if (needConversion) {
-            auto conversionKind = isAssignment ? ConversionKind::Implicit
-                                               : ConversionKind::Propagated;
             result = &ConversionExpression::makeImplicit(context, newType, conversionKind, expr,
                                                          parentExpr, opRange);
         }
@@ -222,10 +218,7 @@ const Expression& Expression::bindLValue(const ExpressionSyntax& lhs, const Type
     // Create a placeholder expression that will carry the type of the rhs.
     // Nothing will ever actually look at this expression, it's there only
     // to fill the space in the created AssignmentExpression.
-    SourceRange rhsRange{location, location};
-    auto rhsExpr = comp.emplace<EmptyArgumentExpression>(rhs, rhsRange);
-    if (rhsExpr->bad())
-        return badExpr(comp, nullptr);
+    auto rhsExpr = comp.emplace<EmptyArgumentExpression>(rhs, SourceRange{location, location});
 
     auto instance = context.getInstance();
     Expression* lhsExpr;
@@ -244,29 +237,27 @@ const Expression& Expression::bindLValue(const ExpressionSyntax& lhs, const Type
     }
 
     bitmask<AssignFlags> assignFlags;
-    if (instance) {
-        if (isInout)
-            assignFlags = AssignFlags::InOutPort;
-        else if (instance->kind != SymbolKind::PrimitiveInstance)
-            assignFlags = AssignFlags::OutputPort;
-    }
-
-    bitmask<ASTFlags> astFlags = ASTFlags::OutputArg;
-    if (context.flags.has(ASTFlags::NotADriver))
-        astFlags |= ASTFlags::NotADriver;
+    if (instance && isInout)
+        assignFlags = AssignFlags::InOutPort;
 
     SourceRange lhsRange = lhs.sourceRange();
     return AssignmentExpression::fromComponents(comp, std::nullopt, assignFlags, *lhsExpr, *rhsExpr,
                                                 lhsRange, /* timingControl */ nullptr, lhsRange,
-                                                context.resetFlags(astFlags));
+                                                context.resetFlags(ASTFlags::OutputArg));
 }
 
 const Expression& Expression::bindLValue(const ExpressionSyntax& syntax, const ASTContext& context,
                                          bitmask<AssignFlags> assignFlags) {
-    auto& expr = bind(syntax, context, ASTFlags::LValue);
-    if (!expr.requireLValue(context, {}, assignFlags))
-        return badExpr(context.getCompilation(), &expr);
-    return expr;
+    auto& comp = context.getCompilation();
+    auto lhs = &create(comp, syntax, context, ASTFlags::LValue);
+    selfDetermined(context, lhs);
+
+    auto rhs = comp.emplace<EmptyArgumentExpression>(*lhs->type, lhs->sourceRange);
+
+    return AssignmentExpression::fromComponents(comp, std::nullopt, assignFlags, *lhs, *rhs,
+                                                lhs->sourceRange, /* timingControl */ nullptr,
+                                                lhs->sourceRange,
+                                                context.resetFlags(ASTFlags::OutputArg));
 }
 
 const Expression& Expression::bindRValue(const Type& lhs, const ExpressionSyntax& rhs,
@@ -373,10 +364,6 @@ const Expression& Expression::bindRefArg(const Type& lhs, bitmask<VariableFlags>
 
     // ref args are considered drivers unless they are const.
     if (!isConstRef) {
-        // The check for ref-args is more strict than the check for lvalues,
-        // so the net effect of this call is to get a driver registered for
-        // us without duplicating the logic for determining longest static prefix.
-        expr.requireLValue(context);
         if (auto sym = expr.getSymbolReference())
             comp.noteReference(*sym, /* isLValue */ true);
     }
@@ -403,16 +390,15 @@ const Expression& Expression::bindArgument(const Type& argType, ArgumentDirectio
 }
 
 bool Expression::checkConnectionDirection(const Expression& expr, ArgumentDirection direction,
-                                          const ASTContext& context, SourceLocation loc,
-                                          bitmask<AssignFlags> flags) {
+                                          const ASTContext& context, SourceLocation loc) {
     switch (direction) {
         case ArgumentDirection::In:
             // All expressions are fine for inputs.
             return true;
         case ArgumentDirection::Out:
-            return expr.requireLValue(context, loc, flags);
+            return expr.requireLValue(context, loc);
         case ArgumentDirection::InOut:
-            return expr.requireLValue(context, loc, flags | AssignFlags::InOutPort);
+            return expr.requireLValue(context, loc, AssignFlags::InOutPort);
         case ArgumentDirection::Ref:
             if (!canConnectToRefArg(context, expr, VariableFlags::None)) {
                 context.addDiag(diag::InvalidRefArg, loc) << expr.sourceRange;
@@ -486,46 +472,45 @@ LValue Expression::evalLValue(EvalContext& context) const {
     return visit(visitor, context);
 }
 
-std::optional<ConstantRange> Expression::evalSelector(EvalContext& context) const {
+std::optional<ConstantRange> Expression::evalSelector(EvalContext& context,
+                                                      bool enforceBounds) const {
     ConstantValue unused1;
     bool unused2;
     switch (kind) {
         case ExpressionKind::ElementSelect:
             return as<ElementSelectExpression>().evalIndex(context, nullptr, unused1, unused2);
         case ExpressionKind::RangeSelect:
-            return as<RangeSelectExpression>().evalRange(context, nullptr);
+            return as<RangeSelectExpression>().evalRange(context, nullptr, enforceBounds);
         default:
             return {};
     }
 }
 
 bool Expression::requireLValue(const ASTContext& context, SourceLocation location,
-                               bitmask<AssignFlags> flags,
-                               const Expression* longestStaticPrefix) const {
+                               bitmask<AssignFlags> flags) const {
     switch (kind) {
         case ExpressionKind::NamedValue:
         case ExpressionKind::HierarchicalValue: {
             auto& ve = as<ValueExpressionBase>();
-            return ve.requireLValueImpl(context, location, flags, longestStaticPrefix);
+            return ve.requireLValueImpl(context, location, flags);
         }
         case ExpressionKind::ElementSelect: {
             auto& select = as<ElementSelectExpression>();
-            return select.requireLValueImpl(context, location, flags, longestStaticPrefix);
+            return select.requireLValueImpl(context, location, flags);
         }
         case ExpressionKind::RangeSelect: {
             auto& select = as<RangeSelectExpression>();
-            return select.requireLValueImpl(context, location, flags, longestStaticPrefix);
+            return select.requireLValueImpl(context, location, flags);
         }
         case ExpressionKind::MemberAccess: {
             auto& access = as<MemberAccessExpression>();
-            return access.requireLValueImpl(context, location, flags, longestStaticPrefix);
+            return access.requireLValueImpl(context, location, flags);
         }
         case ExpressionKind::Concatenation: {
             auto& concat = as<ConcatenationExpression>();
             if (!concat.type->isIntegral())
                 break;
 
-            SLANG_ASSERT(!longestStaticPrefix || flags.has(AssignFlags::SlicedPort));
             for (auto op : concat.operands()) {
                 if (!op->requireLValue(context, location, flags | AssignFlags::InConcat)) {
                     return false;
@@ -536,21 +521,17 @@ bool Expression::requireLValue(const ASTContext& context, SourceLocation locatio
         case ExpressionKind::SimpleAssignmentPattern:
             return as<SimpleAssignmentPatternExpression>().isLValue;
         case ExpressionKind::Streaming: {
-            SLANG_ASSERT(!longestStaticPrefix);
             auto& stream = as<StreamingConcatenationExpression>();
             for (auto& op : stream.streams()) {
-                if (!op.operand->requireLValue(context, location, flags | AssignFlags::InConcat,
-                                               longestStaticPrefix)) {
+                if (!op.operand->requireLValue(context, location, flags | AssignFlags::InConcat))
                     return false;
-                }
             }
             return true;
         }
         case ExpressionKind::Conversion: {
             auto& conv = as<ConversionExpression>();
-            if (conv.isImplicit()) {
-                return conv.operand().requireLValue(context, location, flags, longestStaticPrefix);
-            }
+            if (conv.isImplicit())
+                return conv.operand().requireLValue(context, location, flags);
             break;
         }
         case ExpressionKind::Invalid:
@@ -565,59 +546,6 @@ bool Expression::requireLValue(const ASTContext& context, SourceLocation locatio
     auto& diag = context.addDiag(diag::ExpressionNotAssignable, location);
     diag << sourceRange;
     return false;
-}
-
-void Expression::getLongestStaticPrefixes(
-    SmallVector<std::pair<const ValueSymbol*, const Expression*>>& results,
-    EvalContext& evalContext, const Expression* longestStaticPrefix) const {
-
-    switch (kind) {
-        case ExpressionKind::NamedValue:
-        case ExpressionKind::HierarchicalValue: {
-            auto& ve = as<ValueExpressionBase>();
-            ve.getLongestStaticPrefixesImpl(results, longestStaticPrefix);
-            break;
-        }
-        case ExpressionKind::ElementSelect: {
-            auto& select = as<ElementSelectExpression>();
-            select.getLongestStaticPrefixesImpl(results, evalContext, longestStaticPrefix);
-            break;
-        }
-        case ExpressionKind::RangeSelect: {
-            auto& select = as<RangeSelectExpression>();
-            select.getLongestStaticPrefixesImpl(results, evalContext, longestStaticPrefix);
-            break;
-        }
-        case ExpressionKind::MemberAccess: {
-            auto& access = as<MemberAccessExpression>();
-            access.getLongestStaticPrefixesImpl(results, evalContext, longestStaticPrefix);
-            break;
-        }
-        case ExpressionKind::Concatenation: {
-            auto& concat = as<ConcatenationExpression>();
-            if (concat.type->isIntegral()) {
-                for (auto op : concat.operands())
-                    op->getLongestStaticPrefixes(results, evalContext, nullptr);
-            }
-            break;
-        }
-        case ExpressionKind::Streaming: {
-            SLANG_ASSERT(!longestStaticPrefix);
-            auto& stream = as<StreamingConcatenationExpression>();
-            for (auto& op : stream.streams())
-                op.operand->getLongestStaticPrefixes(results, evalContext, nullptr);
-            break;
-        }
-        case ExpressionKind::Conversion: {
-            auto& conv = as<ConversionExpression>();
-            if (conv.isImplicit())
-                conv.operand().getLongestStaticPrefixes(results, evalContext, longestStaticPrefix);
-            break;
-        }
-        case ExpressionKind::Invalid:
-        default:
-            break;
-    }
 }
 
 std::optional<bitwidth_t> Expression::getEffectiveWidth() const {
@@ -746,6 +674,10 @@ bool Expression::hasHierarchicalReference() const {
     HierarchicalVisitor visitor;
     visit(visitor);
     return visitor.any;
+}
+
+bool Expression::isParenthesized() const {
+    return syntax && syntax->kind == SyntaxKind::ParenthesizedExpression;
 }
 
 const Expression& Expression::unwrapImplicitConversions() const {
@@ -1090,14 +1022,14 @@ Expression& Expression::bindName(Compilation& comp, const NameSyntax& syntax,
     return bindLookupResult(comp, result, syntax.sourceRange(), invocation, withClause, context);
 }
 
-Expression& Expression::bindLookupResult(Compilation& compilation, LookupResult& result,
+Expression& Expression::bindLookupResult(Compilation& comp, LookupResult& result,
                                          SourceRange sourceRange,
                                          const InvocationExpressionSyntax* invocation,
                                          const ArrayOrRandomizeMethodExpressionSyntax* withClause,
                                          const ASTContext& context) {
     const Symbol* symbol = result.found;
     if (!symbol)
-        return badExpr(compilation, nullptr);
+        return badExpr(comp, nullptr);
 
     auto errorIfInvoke = [&]() {
         // If we require a subroutine, enforce that now. The invocation syntax will have been
@@ -1118,10 +1050,10 @@ Expression& Expression::bindLookupResult(Compilation& compilation, LookupResult&
 
     if (context.flags.has(ASTFlags::AllowDataType) && symbol->isType()) {
         // We looked up a named data type and we were allowed to do so, so return it.
-        const Type& resultType = Type::fromLookupResult(compilation, result, sourceRange, context);
-        auto expr = compilation.emplace<DataTypeExpression>(resultType, sourceRange);
+        const Type& resultType = Type::fromLookupResult(comp, result, sourceRange, context);
+        auto expr = comp.emplace<DataTypeExpression>(resultType, sourceRange);
         if (!expr->bad() && !errorIfInvoke())
-            return badExpr(compilation, expr);
+            return badExpr(comp, expr);
 
         return *expr;
     }
@@ -1133,9 +1065,8 @@ Expression& Expression::bindLookupResult(Compilation& compilation, LookupResult&
         symbol->as<VariableSymbol>().flags.has(VariableFlags::CompilerGenerated)) {
 
         auto scope = symbol->getParentScope();
-        if (scope &&
-            (invocation || (context.flags.has(ASTFlags::TopLevelStatement) &&
-                            compilation.hasFlag(CompilationFlags::AllowRecursiveImplicitCall)))) {
+        if (scope && (invocation || (context.flags.has(ASTFlags::TopLevelStatement) &&
+                                     comp.hasFlag(CompilationFlags::AllowRecursiveImplicitCall)))) {
             auto& sym = scope->asSymbol();
             if (sym.kind == SymbolKind::Subroutine &&
                 sym.as<SubroutineSymbol>().returnValVar == symbol) {
@@ -1150,8 +1081,8 @@ Expression& Expression::bindLookupResult(Compilation& compilation, LookupResult&
         case SymbolKind::Subroutine: {
             SLANG_ASSERT(result.selectors.empty());
             SourceRange callRange = invocation ? invocation->sourceRange() : sourceRange;
-            expr = &CallExpression::fromLookup(compilation, &symbol->as<SubroutineSymbol>(),
-                                               nullptr, invocation, withClause, callRange, context);
+            expr = &CallExpression::fromLookup(comp, &symbol->as<SubroutineSymbol>(), nullptr,
+                                               invocation, withClause, callRange, context);
             invocation = nullptr;
             withClause = nullptr;
             break;
@@ -1180,9 +1111,9 @@ Expression& Expression::bindLookupResult(Compilation& compilation, LookupResult&
             // If there are selectors then this is ok -- either they will be valid because
             // they're accessing a built-in method or they will issue an error.
             const bool constraintAllowed = !result.selectors.empty();
-            expr = &ValueExpressionBase::fromSymbol(
-                context, *symbol, result.flags.has(LookupResultFlags::IsHierarchical), sourceRange,
-                constraintAllowed);
+            auto hierRef = HierarchicalReference::fromLookup(comp, result);
+            expr = &ValueExpressionBase::fromSymbol(context, *symbol, &hierRef, sourceRange,
+                                                    constraintAllowed);
             break;
         }
         default: {
@@ -1190,9 +1121,9 @@ Expression& Expression::bindLookupResult(Compilation& compilation, LookupResult&
                 context.flags.has(ASTFlags::LValue) && !result.selectors.empty() &&
                 std::get_if<LookupResult::MemberSelector>(&result.selectors[0]) != nullptr;
 
-            expr = &ValueExpressionBase::fromSymbol(
-                context, *symbol, result.flags.has(LookupResultFlags::IsHierarchical), sourceRange,
-                /* constraintAllowed */ false, isDottedAccess);
+            auto hierRef = HierarchicalReference::fromLookup(comp, result);
+            expr = &ValueExpressionBase::fromSymbol(context, *symbol, &hierRef, sourceRange,
+                                                    /* constraintAllowed */ false, isDottedAccess);
             break;
         }
     }
@@ -1212,15 +1143,15 @@ Expression& Expression::bindLookupResult(Compilation& compilation, LookupResult&
 
                 nextResult.reportDiags(context);
                 if (!nextResult.found)
-                    return badExpr(compilation, expr);
+                    return badExpr(comp, expr);
 
-                return bindLookupResult(compilation, nextResult, sourceRange, invocation,
-                                        withClause, context);
+                return bindLookupResult(comp, nextResult, sourceRange, invocation, withClause,
+                                        context);
             }
 
             if (i == result.selectors.size() - 1) {
-                expr = &MemberAccessExpression::fromSelector(compilation, *expr, *memberSelect,
-                                                             invocation, withClause, context,
+                expr = &MemberAccessExpression::fromSelector(comp, *expr, *memberSelect, invocation,
+                                                             withClause, context,
                                                              /* isFromLookupChain */ true);
 
                 if (expr->kind == ExpressionKind::Call) {
@@ -1229,20 +1160,20 @@ Expression& Expression::bindLookupResult(Compilation& compilation, LookupResult&
                 }
             }
             else {
-                expr = &MemberAccessExpression::fromSelector(compilation, *expr, *memberSelect,
-                                                             nullptr, nullptr, context,
+                expr = &MemberAccessExpression::fromSelector(comp, *expr, *memberSelect, nullptr,
+                                                             nullptr, context,
                                                              /* isFromLookupChain */ true);
             }
         }
         else {
             // Element / range selectors.
             auto selectSyntax = std::get<const ElementSelectSyntax*>(selector);
-            expr = &bindSelector(compilation, *expr, *selectSyntax, context);
+            expr = &bindSelector(comp, *expr, *selectSyntax, context);
         }
     }
 
     if (!expr->bad() && !errorIfInvoke())
-        return badExpr(compilation, expr);
+        return badExpr(comp, expr);
 
     return *expr;
 }
@@ -1370,6 +1301,9 @@ Expression* Expression::tryBindInterfaceRef(const ASTContext& context,
 
     // If we found an interface port we should unwrap to what it's connected to.
     if (symbol->kind == SymbolKind::InterfacePort) {
+        result.flags |= LookupResultFlags::IfacePort;
+        result.path.emplace_back(*symbol);
+
         ifacePort = &symbol->as<InterfacePortSymbol>();
         std::tie(symbol, modport) = ifacePort->getConnection();
 
@@ -1412,7 +1346,8 @@ Expression* Expression::tryBindInterfaceRef(const ASTContext& context,
         if (symbol->kind == SymbolKind::UninstantiatedDef ||
             (symbol->kind == SymbolKind::Variable &&
              symbol->as<VariableSymbol>().getType().isError())) {
-            return comp.emplace<ArbitrarySymbolExpression>(*origSymbol, comp.getErrorType(),
+            return comp.emplace<ArbitrarySymbolExpression>(*context.scope, *origSymbol,
+                                                           comp.getErrorType(), nullptr,
                                                            syntax.sourceRange());
         }
 
@@ -1441,10 +1376,22 @@ Expression* Expression::tryBindInterfaceRef(const ASTContext& context,
         iface = &symbol->as<InstanceSymbol>().body;
     }
 
-    if (iface->hierarchyOverrideNode) {
-        auto& diag = context.addDiag(diag::VirtualIfaceDefparam, sourceRange);
-        if (auto source = findOverrideNodeSource(*iface->hierarchyOverrideNode))
-            diag.addNote(diag::NoteDeclarationHere, source->sourceRange());
+    if (!isInterfacePort) {
+        if (iface->hierarchyOverrideNode) {
+            auto& diag = context.addDiag(diag::VirtualIfaceDefparam, sourceRange);
+            if (auto source = findOverrideNodeSource(*iface->hierarchyOverrideNode))
+                diag.addNote(diag::NoteDeclarationHere, source->sourceRange());
+        }
+
+        if (iface->parentInstance && iface->parentInstance->resolvedConfig) {
+            auto& diag = context.addDiag(diag::VirtualIfaceConfigRule, sourceRange);
+
+            auto rc = iface->parentInstance->resolvedConfig;
+            if (rc->configRule)
+                diag.addNote(diag::NoteConfigRule, rc->configRule->syntax->sourceRange());
+            else
+                diag.addNote(diag::NoteConfigRule, rc->useConfig.location);
+        }
     }
 
     if (!arrayModportName.empty()) {
@@ -1486,7 +1433,9 @@ Expression* Expression::tryBindInterfaceRef(const ASTContext& context,
         origSymbol = origSymbol->as<InstanceBodySymbol>().parentInstance;
     }
 
-    return comp.emplace<ArbitrarySymbolExpression>(*origSymbol, *type, sourceRange);
+    auto hierRef = HierarchicalReference::fromLookup(comp, result);
+    return comp.emplace<ArbitrarySymbolExpression>(*context.scope, *origSymbol, *type, &hierRef,
+                                                   sourceRange);
 }
 
 void Expression::findPotentiallyImplicitNets(
@@ -1509,6 +1458,8 @@ void Expression::findPotentiallyImplicitNets(
             ASTContext ctx(*context.scope, LookupLocation::max);
             Lookup::name(nameSyntax, ctx, flags, result);
 
+            SLANG_ASSERT(!result.flags.has(LookupResultFlags::IsHierarchical));
+
             if (!result.found && !result.hasError())
                 results.push_back(&nameSyntax.as<IdentifierNameSyntax>());
         }
@@ -1523,14 +1474,14 @@ void Expression::findPotentiallyImplicitNets(
 
 void Expression::contextDetermined(const ASTContext& context, Expression*& expr,
                                    const Expression* parentExpr, const Type& newType,
-                                   SourceRange opRange, bool isAssignment) {
-    PropagationVisitor visitor(context, newType, parentExpr, opRange, isAssignment);
+                                   SourceRange opRange, ConversionKind conversionKind) {
+    PropagationVisitor visitor(context, newType, parentExpr, opRange, conversionKind);
     expr = &expr->visit(visitor);
 }
 
 void Expression::selfDetermined(const ASTContext& context, Expression*& expr) {
     SLANG_ASSERT(expr->type);
-    PropagationVisitor visitor(context, *expr->type, nullptr, {}, false);
+    PropagationVisitor visitor(context, *expr->type, nullptr, {}, ConversionKind::Propagated);
     expr = &expr->visit(visitor);
 }
 

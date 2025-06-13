@@ -5,23 +5,29 @@
 #include "TidyDiags.h"
 #include "fmt/color.h"
 
+#include "slang/analysis/AnalysisManager.h"
 #include "slang/syntax/AllSyntax.h"
 
 using namespace slang;
 using namespace slang::ast;
+using namespace slang::analysis;
 
 namespace no_latches_on_design {
 struct MainVisitor : public TidyVisitor, ASTVisitor<MainVisitor, true, false> {
-    explicit MainVisitor(Diagnostics& diagnostics) : TidyVisitor(diagnostics) {}
+    const AnalysisManager& analysisManager;
+
+    MainVisitor(Diagnostics& diagnostics, const AnalysisManager& analysisManager) :
+        TidyVisitor(diagnostics), analysisManager(analysisManager) {}
 
     void handle(const VariableSymbol& symbol) {
         NEEDS_SKIP_SYMBOL(symbol)
 
-        if (symbol.drivers().empty())
+        auto drivers = analysisManager.getDrivers(symbol);
+        if (drivers.empty())
             return;
 
-        auto firstDriver = *symbol.drivers().begin();
-        if (firstDriver && firstDriver->isInAlwaysLatchBlock()) {
+        auto firstDriver = drivers[0].first;
+        if (firstDriver && firstDriver->source == DriverSource::AlwaysLatch) {
             diags.add(diag::NoLatchesOnDesign, symbol.location);
         }
     }
@@ -32,10 +38,12 @@ using namespace no_latches_on_design;
 
 class NoLatchesOnDesign : public TidyCheck {
 public:
-    [[maybe_unused]] explicit NoLatchesOnDesign(TidyKind kind) : TidyCheck(kind) {}
+    [[maybe_unused]] explicit NoLatchesOnDesign(TidyKind kind,
+                                                std::optional<slang::DiagnosticSeverity> severity) :
+        TidyCheck(kind, severity) {}
 
-    bool check(const RootSymbol& root) override {
-        MainVisitor visitor(diagnostics);
+    bool check(const RootSymbol& root, const AnalysisManager& analysisManager) override {
+        MainVisitor visitor(diagnostics, analysisManager);
         root.visit(visitor);
         return diagnostics.empty();
     }
@@ -44,7 +52,7 @@ public:
 
     std::string diagString() const override { return "latches are not allowed in this design"; }
 
-    DiagnosticSeverity diagSeverity() const override { return DiagnosticSeverity::Error; }
+    DiagnosticSeverity diagDefaultSeverity() const override { return DiagnosticSeverity::Error; }
 
     std::string name() const override { return "NoLatchesOnDesign"; }
 

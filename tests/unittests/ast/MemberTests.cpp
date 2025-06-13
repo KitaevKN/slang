@@ -4,7 +4,7 @@
 #include "Test.h"
 
 #include "slang/ast/ASTVisitor.h"
-#include "slang/ast/Statements.h"
+#include "slang/ast/Statement.h"
 #include "slang/ast/expressions/AssignmentExpressions.h"
 #include "slang/ast/expressions/CallExpression.h"
 #include "slang/ast/expressions/OperatorExpressions.h"
@@ -166,7 +166,7 @@ endmodule
     compilation.addSyntaxTree(tree);
 
     auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 10);
+    REQUIRE(diags.size() == 9);
     CHECK(diags[0].code == diag::DelayNotNumeric);
     CHECK(diags[1].code == diag::ConstEvalNonConstVariable);
     CHECK(diags[2].code == diag::ConstEvalNonConstVariable);
@@ -176,7 +176,6 @@ endmodule
     CHECK(diags[6].code == diag::DynamicNotProcedural);
     CHECK(diags[7].code == diag::Delay3OnVar);
     CHECK(diags[8].code == diag::NonProceduralFuncArg);
-    CHECK(diags[9].code == diag::MultipleContAssigns);
 }
 
 TEST_CASE("User defined nettypes") {
@@ -218,7 +217,7 @@ endpackage
     CHECK(root.lookupName<NetSymbol>("m.a").getType().toString() == "logic[3:0]");
     CHECK(root.lookupName<NetSymbol>("m.b").netType.name == "bar");
     CHECK(root.lookupName<NetSymbol>("m.b").getType().toString() == "logic[3:0]");
-    CHECK(root.lookupName<NetSymbol>("m.c").getType().toString() == "logic[10:0]");
+    CHECK(root.lookupName<NetSymbol>("m.c").getType().toString() == "m.stuff");
     CHECK(root.lookupName<NetSymbol>("m.e").getType().toString() == "logic[3:0]$[0:4]");
 }
 
@@ -940,7 +939,7 @@ module m4;
     wire e;
     for (genvar i = 0; i < 3; i++) begin : L0
         if (i != 1) begin : L1
-            let my_let(x) = !x || b && c[i];
+            let my_let(x) = !x || (b && c[i]);
             assign d[2 - i] = my_let(a); // OK
         end : L1
     end : L0
@@ -985,7 +984,10 @@ module my_checker;
     wire [1:0] req;
     wire [1:0] vld;
     logic ovr;
-    if (valid_arb(.request(req), .valid(vld), .override(ovr))) begin
+
+    always_comb begin
+        if (valid_arb(.request(req), .valid(vld), .override(ovr))) begin
+        end
     end
 endmodule
 )");
@@ -1010,7 +1012,7 @@ module m;
     wire e;
     for (genvar i = 0; i < 3; i++) begin : L0
         if (i !=1) begin : L1
-            let my_let(x) = !x || b && c[i];
+            let my_let(x) = !x || (b && c[i]);
             assign d[2 - i] = my_let(a); // OK
         end : L1
     end : L0
@@ -1052,13 +1054,11 @@ endmodule
 
     auto& foo = compilation.getRoot()
                     .lookupName<GenerateBlockArraySymbol>("top.m1[2][1][3].asdf")
-                    .memberAt<GenerateBlockSymbol>(1)
+                    .memberAt<GenerateBlockSymbol>(2)
                     .memberAt<GenerateBlockSymbol>(1)
                     .find<VariableSymbol>("foo");
 
-    std::string path;
-    foo.getHierarchicalPath(path);
-    CHECK(path == "top.m1[2][1][3].asdf[1].genblk1.foo");
+    CHECK(foo.getHierarchicalPath() == "top.m1[2][1][3].asdf[1].genblk1.foo");
 }
 
 TEST_CASE("Hierarchical paths with unnamed generate arrays") {
@@ -1077,7 +1077,7 @@ endmodule
 
     std::string path;
     compilation.getRoot().visit(
-        makeVisitor([&](auto& v, const VariableSymbol& sym) { sym.getHierarchicalPath(path); }));
+        makeVisitor([&](auto& v, const VariableSymbol& sym) { sym.appendHierarchicalPath(path); }));
     CHECK(path == "top.genblk1[0].a");
 }
 
@@ -1132,6 +1132,24 @@ source:18:29: note: comparison reduces to (12 < 8)
         $static_assert((foo < $bits(bar)));
                         ~~~~^~~~~~~~~~~~
 )");
+}
+
+TEST_CASE("static_assert ignore uninstantiated") {
+    auto tree = SyntaxTree::fromText(R"(
+module top;
+endmodule
+
+module m;
+    $static_assert(0);
+endmodule
+)");
+
+    CompilationOptions options;
+    options.topModules.insert("top");
+
+    Compilation compilation(options);
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
 }
 
 TEST_CASE("$static_assert with let expression") {
@@ -1242,13 +1260,10 @@ endmodule
     compilation.addSyntaxTree(tree);
 
     auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 6);
+    REQUIRE(diags.size() == 3);
     CHECK(diags[0].code == diag::ForkJoinAlwaysComb);
-    CHECK(diags[1].code == diag::MultipleAlwaysAssigns);
-    CHECK(diags[2].code == diag::MultipleAlwaysAssigns);
-    CHECK(diags[3].code == diag::MultipleAlwaysAssigns);
-    CHECK(diags[4].code == diag::ForkJoinAlwaysComb);
-    CHECK(diags[5].code == diag::TimingInFuncNotAllowed);
+    CHECK(diags[1].code == diag::ForkJoinAlwaysComb);
+    CHECK(diags[2].code == diag::TimingInFuncNotAllowed);
 }
 
 TEST_CASE("always_ff timing (pass)") {
@@ -1263,9 +1278,7 @@ endmodule
 
     Compilation compilation;
     compilation.addSyntaxTree(tree);
-
-    auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 0);
+    NO_COMPILATION_ERRORS;
 }
 
 TEST_CASE("always_ff timing (fail)") {
@@ -1291,49 +1304,6 @@ endmodule
     REQUIRE(diags.size() == 2);
     CHECK(diags[0].code == diag::BlockingInAlwaysFF);
     CHECK(diags[1].code == diag::BlockingInAlwaysFF);
-}
-
-TEST_CASE("always_comb drivers within nested functions") {
-    auto tree = SyntaxTree::fromText(R"(
-module m;
-    int baz;
-
-    function void f1(int bar);
-      baz = bar;
-    endfunction
-
-    function void f2(int bar);
-      f1(bar);
-    endfunction
-
-    always_comb f2(2);
-    always_comb f2(3);
-
-    int v;
-    function void f3(int bar);
-      v = bar;
-    endfunction
-
-    always_comb f3(4);
-
-    int foo;
-    task t;
-      foo <= 1;
-    endtask
-
-    always_comb begin
-      foo <= 2;
-      t();
-    end
-endmodule
-)");
-
-    Compilation compilation;
-    compilation.addSyntaxTree(tree);
-
-    auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 1);
-    CHECK(diags[0].code == diag::MultipleAlwaysAssigns);
 }
 
 TEST_CASE("always_comb timing inside assertion") {
@@ -1417,28 +1387,6 @@ endmodule
     NO_COMPILATION_ERRORS;
 }
 
-TEST_CASE("always_comb dup driver with initial block with language option") {
-    auto tree = SyntaxTree::fromText(R"(
-module m;
-    int foo[2];
-
-    initial begin
-        for (int i = 0; i < 2; i++)
-            foo[i] = 0;
-    end
-
-    always_comb foo[1] = 1;
-endmodule
-)");
-
-    CompilationOptions options;
-    options.flags |= CompilationFlags::AllowDupInitialDrivers;
-
-    Compilation compilation(options);
-    compilation.addSyntaxTree(tree);
-    NO_COMPILATION_ERRORS;
-}
-
 TEST_CASE("always_ff timing control restrictions") {
     auto tree = SyntaxTree::fromText(R"(
 module m;
@@ -1473,72 +1421,6 @@ endmodule
     CHECK(diags[0].code == diag::AlwaysFFEventControl);
     CHECK(diags[1].code == diag::AlwaysFFEventControl);
     CHECK(diags[2].code == diag::BlockingInAlwaysFF);
-}
-
-TEST_CASE("hierarchical driver errors") {
-    auto tree = SyntaxTree::fromText(R"(
-interface I;
-    int foo;
-endinterface
-
-module m;
-    I i();
-
-    n n1(i);
-    n n2(i);
-endmodule
-
-module n(I i);
-    always_comb i.foo = 1;
-endmodule
-)");
-
-    Compilation compilation;
-    compilation.addSyntaxTree(tree);
-
-    auto& diags = compilation.getAllDiagnostics();
-    std::string result = "\n" + report(diags);
-    CHECK(result == R"(
-source:14:17: error: variable 'foo' driven by always_comb procedure cannot be written to by any other process
-    always_comb i.foo = 1;
-                ^~~~~
-note: from 'm.n2' and 'm.n1'
-)");
-}
-
-TEST_CASE("lvalue driver assertion regression GH #551") {
-    auto tree = SyntaxTree::fromText(R"(
-module M #(parameter int W=1) (
-    input  logic         clk,
-    input  logic         rst,
-    input  logic [W-1:0] d,
-    output logic [W-1:0] o
-);
-endmodule
-
-module M2 #(
-    parameter int W = 2
-) (
-    input logic clk,
-    input logic rst
-);
-    localparam int W_MAX = $clog2(W);
-
-    logic [W_MAX:0] d, o;
-    logic x_d, x_o;
-
-    M m [W_MAX+1:0] (
-        .clk (clk),
-        .rst (rst),
-        .d   ({x_d, d}),
-        .o   ({x_o, o})
-    );
-endmodule
-)");
-
-    Compilation compilation;
-    compilation.addSyntaxTree(tree);
-    NO_COMPILATION_ERRORS;
 }
 
 TEST_CASE("Specify path descriptions") {
@@ -1974,6 +1856,16 @@ module overlap2(inout wire [15:0] bus16, inout wire [11:0] low12, high12);
     alias high12[7:0] = low12[11:4];
 endmodule
 
+module overlap3(inout wire [15:0] bus16, inout wire [11:0] low12, high12);
+    alias low12 = bus16[11:0];
+    alias high12 = bus16[15:4];
+endmodule
+
+module overlap4(inout wire [15:0] bus16, inout wire [11:0] low12, high12);
+    alias {high12, low12[3:0]} = bus16;
+    alias low12[11:4] = high12[7:0];
+endmodule
+
 module lib1_dff(input logic Reset, Clk, Data, Q, Q_Bar);
 endmodule
 
@@ -1986,6 +1878,58 @@ module my_dff(rst, clk, d, q, q_bar);
     alias q = Q;
     alias Q_ = q_bar = Q_Bar = qbar;
     lib1_dff my_dff (.*);
+endmodule
+
+module m;
+    wire [1:0] a, b, c;
+    alias a = b[1:0];
+    alias c = b[1:0];
+endmodule
+
+module m1(input wire [15:0] a, input wire [1:0] b);
+    alias {a[0], a[1]} = b[1:0];
+endmodule
+
+module m2(input wire [15:0] a, input wire [1:0] b);
+    alias {a[0], a[1]} = b;
+endmodule
+
+module m3(input wire [15:0] a, input wire [1:0] b);
+    alias a[1] = b[0];
+    alias a[0] = b[1];
+endmodule
+
+module m4(input wire [15:0] a, input wire [2:0] b, input wire [2:0] c, input wire [2:0] d, input wire [2:0] e);
+    alias {a[1], c[0]} = {d[0], b[1]};
+endmodule
+
+module m5(input wire [15:0] a, input wire [2:0] b, input wire [2:0] c, input wire [2:0] d, input wire [2:0] e);
+    alias {b, b} = {c, d};
+endmodule
+
+module m6(input wire [15:0] a, input wire [2:0] b, input wire [2:0] c, input wire [2:0] d, input wire [2:0] e);
+   alias {b, e}  = {c, d};
+endmodule
+
+module m7(input wire [15:0] a, input wire [2:0] b, input wire [2:0] c, input wire [2:0] d, input wire [2:0] e);
+   alias b = d;
+   alias {b, e[0]}  = {c, d[0]};
+   alias e[1] = d[1];
+endmodule
+
+module m8(input wire [15:0] a, input wire [2:0] b, input wire [2:0] c, input wire [2:0] d, input wire [2:0] e);
+   alias {b, e[0]}  = {c, d[0]};
+   alias e[1] = d[2];
+endmodule
+
+module m9(input wire [15:0] a, input wire [15:0] b, input wire [14:0] c, input wire [15:0] d, input wire [2:0] e);
+  alias b[13:0] = d[13:0];
+  alias b  = {c, d[14]};
+endmodule
+
+module m10(input wire [15:0] a, input wire [1:0] b);
+  alias a[1] = b[0];
+  alias a[0] = a[1];
 endmodule
 )");
 
@@ -2018,6 +1962,86 @@ endmodule
     CHECK(diags[2].code == diag::NetAliasNotANet);
     CHECK(diags[3].code == diag::NetAliasHierarchical);
     CHECK(diags[4].code == diag::NetAliasCommonNetType);
+}
+
+TEST_CASE("Net alias overlap") {
+    auto tree = SyntaxTree::fromText(R"(
+module overlap(inout wire [15:0] bus16, inout wire [11:0] low12, high12, inout wire [32:0] c, inout wire [16:0] b, inout wire [32:0] b2);
+    alias bus16 = {{high12[4:0], high12[6:0]}, bus16[3:0]} = {bus16[15:12], high12};
+    alias low12[0:0] = a;
+    alias low12 = {low12} = {low12};
+    alias a = a;
+    alias b[2:0] = {c[2:0]};
+    alias b1 = {c[1:1]};
+    alias b2 = c;
+    alias bus16 = {high12[11:8], low12};
+    alias bus16 = {high12, low12[3:0]};
+    alias bus16 = {high12, bus16[3:0]} = {bus16[15:12], low12};
+    module overlapnested(inout wire [15:0] bus15);
+        alias bus15 = bus16;
+        alias bus15 = bus16;
+    endmodule
+    overlapnested ov(bus16);
+endmodule
+
+module m1(input wire [15:0] a, input wire [1:0] b);
+    alias {a[0], a[1]} = b[1:0];
+    alias {a[0], a[1]} = b;
+    alias a[1] = b[0];
+    alias a[0] = b[1];
+endmodule
+
+module m2(input wire [15:0] a, input wire [2:0] b, input wire [2:0] c, input wire [2:0] d, input wire [2:0] e);
+    alias {b, b} = {c, d};
+   alias {b, e}  = {c, d};
+endmodule
+
+module m3(input wire [15:0] a, input wire [2:0] b, input wire [2:0] c, input wire [2:0] d, input wire [2:0] e);
+   alias b = d;
+   alias {b, e[0]}  = {c, d[0]};
+   alias e[1] = d[1];
+   alias {b, e[0]}  = {c, d[0]};
+   alias e[1] = d[2];
+endmodule
+
+module m10(input wire [15:0] a, input wire [15:0] b, input wire [14:0] c, input wire [15:0] d, input wire [2:0] e);
+  alias b[14:0] = d[14:0];
+  alias b  = {c, d[14]};
+endmodule
+
+module m11(input wire [15:0] a, input wire [1:0] b);
+  alias a[1] = b[0];
+  alias a[0] = b[0];
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 22);
+    CHECK(diags[0].code == diag::MultipleNetAlias);
+    CHECK(diags[1].code == diag::NetAliasSelf);
+    CHECK(diags[2].code == diag::NetAliasSelf);
+    CHECK(diags[3].code == diag::MultipleNetAlias);
+    CHECK(diags[4].code == diag::MultipleNetAlias);
+    CHECK(diags[5].code == diag::NetAliasSelf);
+    CHECK(diags[6].code == diag::NetAliasSelf);
+    CHECK(diags[7].code == diag::NetAliasSelf);
+    CHECK(diags[8].code == diag::MultipleNetAlias);
+    CHECK(diags[9].code == diag::MultipleNetAlias);
+    CHECK(diags[10].code == diag::NetAliasSelf);
+    CHECK(diags[11].code == diag::MultipleNetAlias);
+    CHECK(diags[12].code == diag::MultipleNetAlias);
+    CHECK(diags[13].code == diag::MultipleNetAlias);
+    CHECK(diags[14].code == diag::MultipleNetAlias);
+    CHECK(diags[15].code == diag::MultipleNetAlias);
+    CHECK(diags[16].code == diag::MultipleNetAlias);
+    CHECK(diags[17].code == diag::MultipleNetAlias);
+    CHECK(diags[18].code == diag::MultipleNetAlias);
+    CHECK(diags[19].code == diag::MultipleNetAlias);
+    CHECK(diags[20].code == diag::MultipleNetAlias);
+    CHECK(diags[21].code == diag::MultipleNetAlias);
 }
 
 TEST_CASE("Action block parsing regress GH #911") {
@@ -2261,4 +2285,14 @@ endmodule
     Compilation compilation;
     compilation.addSyntaxTree(tree);
     NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Net alias infinite loop regress") {
+    auto tree = SyntaxTree::fromText(R"(
+alias;
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    compilation.getAllDiagnostics();
 }

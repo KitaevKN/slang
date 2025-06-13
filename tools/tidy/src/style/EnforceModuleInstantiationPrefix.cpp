@@ -23,7 +23,8 @@ struct MainVisitor : public TidyVisitor, ASTVisitor<MainVisitor, true, false> {
         std::string_view prefix = config.getCheckConfigs().moduleInstantiationPrefix;
         for (auto& member : instance.body.members()) {
             if (member.kind == SymbolKind::Instance && !member.name.starts_with(prefix)) {
-                diags.add(diag::EnforcePortSuffix, member.location) << member.name << prefix;
+                diags.add(diag::EnforceModuleInstantiationPrefix, member.location)
+                    << member.name << prefix;
             }
         }
     }
@@ -33,16 +34,18 @@ struct MainVisitor : public TidyVisitor, ASTVisitor<MainVisitor, true, false> {
 using namespace enforce_module_instantiation_prefix;
 class EnforceModuleInstantiationPrefix : public TidyCheck {
 public:
-    [[maybe_unused]] explicit EnforceModuleInstantiationPrefix(TidyKind kind) : TidyCheck(kind) {}
+    [[maybe_unused]] explicit EnforceModuleInstantiationPrefix(
+        TidyKind kind, std::optional<slang::DiagnosticSeverity> severity) :
+        TidyCheck(kind, severity) {}
 
-    bool check(const ast::RootSymbol& root) override {
+    bool check(const ast::RootSymbol& root, const slang::analysis::AnalysisManager&) override {
         MainVisitor visitor(diagnostics);
         root.visit(visitor);
         return diagnostics.empty();
     }
 
     DiagCode diagCode() const override { return diag::EnforceModuleInstantiationPrefix; }
-    DiagnosticSeverity diagSeverity() const override { return DiagnosticSeverity::Warning; }
+    DiagnosticSeverity diagDefaultSeverity() const override { return DiagnosticSeverity::Warning; }
     std::string diagString() const override {
         return "module instantiation '{}' is not correctly prefixed with prefix: '{}'";
     }

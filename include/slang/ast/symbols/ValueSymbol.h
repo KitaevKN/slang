@@ -7,19 +7,12 @@
 //------------------------------------------------------------------------------
 #pragma once
 
-#include "slang/ast/SemanticFacts.h"
 #include "slang/ast/Symbol.h"
 #include "slang/ast/types/DeclaredType.h"
-#include "slang/util/IntervalMap.h"
 
 namespace slang::ast {
 
-class EvalContext;
 class PortSymbol;
-class ValueDriver;
-
-using DriverIntervalMap = IntervalMap<uint64_t, const ValueDriver*>;
-using DriverBitRange = std::pair<uint64_t, uint64_t>;
 
 /// A base class for symbols that represent a value (for example a variable or a parameter).
 /// The common functionality is that they all have a type.
@@ -61,18 +54,6 @@ public:
 
     static bool isKind(SymbolKind kind);
 
-    void addDriver(DriverKind kind, const Expression& longestStaticPrefix,
-                   const Symbol& containingSymbol, bitmask<AssignFlags> flags) const;
-
-    void addDriver(DriverKind kind, DriverBitRange bounds, const Expression& longestStaticPrefix,
-                   const Symbol& containingSymbol, const Expression& procCallExpression) const;
-
-    void addDriver(DriverBitRange bounds, const ValueDriver& driver) const;
-
-    std::ranges::subrange<DriverIntervalMap::const_iterator> drivers() const {
-        return {driverMap.begin(), driverMap.end()};
-    }
-
     class PortBackref {
     public:
         not_null<const PortSymbol*> port;
@@ -94,71 +75,7 @@ protected:
 
 private:
     DeclaredType declaredType;
-    mutable DriverIntervalMap driverMap;
     mutable const PortBackref* firstPortBackref = nullptr;
-};
-
-/// Represents an expression that drives a value by assigning
-/// to some range of its type.
-class SLANG_EXPORT ValueDriver {
-public:
-    /// The expression that drives the value.
-    not_null<const Expression*> prefixExpression;
-
-    /// The symbol that contains the driver expression.
-    not_null<const Symbol*> containingSymbol;
-
-    /// If the driver is implied inside a procedure by a subroutine,
-    /// this is the call expression for that subroutine.
-    const Expression* procCallExpression = nullptr;
-
-    /// Flags that control how the driver operates.
-    bitmask<AssignFlags> flags;
-
-    /// The kind of driver (procedural or continuous).
-    DriverKind kind;
-
-    /// Constructs a new ValueDriver instance.
-    ValueDriver(DriverKind kind, const Expression& longestStaticPrefix,
-                const Symbol& containingSymbol, bitmask<AssignFlags> flags) :
-        prefixExpression(&longestStaticPrefix), containingSymbol(&containingSymbol), flags(flags),
-        kind(kind) {}
-
-    /// Indicates whether the driver is for an input port.
-    bool isInputPort() const { return flags.has(AssignFlags::InputPort); }
-
-    /// Indicates whether the driver is for a unidirectional port (i.e. not an inout or ref port).
-    bool isUnidirectionalPort() const {
-        return flags.has(AssignFlags::InputPort | AssignFlags::OutputPort);
-    }
-
-    /// Indicates whether the driver is for a clocking variable.
-    bool isClockVar() const { return flags.has(AssignFlags::ClockVar); }
-
-    /// Indicates whether the driver is for an assertion local variable formal argument.
-    bool isLocalVarFormalArg() const { return flags.has(AssignFlags::AssertionLocalVarFormalArg); }
-
-    /// Indicates whether the driver is inside a single-driver procedure (such as always_comb).
-    bool isInSingleDriverProcedure() const;
-
-    /// Indicates whether the driver is inside a subroutine.
-    bool isInSubroutine() const;
-
-    /// Indicates whether the driver is inside an initial block.
-    bool isInInitialBlock() const;
-
-    /// Indicates whether the driver is inside an always_ff block.
-    bool isInAlwaysFFBlock() const;
-
-    /// Indicates whether the driver is inside an always_latch block.
-    bool isInAlwaysLatchBlock() const;
-
-    /// Gets the source range describing the driver as written in the source code.
-    SourceRange getSourceRange() const;
-
-    /// Computes bounds for a driver given its longest static prefix expression.
-    static std::optional<DriverBitRange> getBounds(const Expression& prefixExpression,
-                                                   EvalContext& evalContext, const Type& rootType);
 };
 
 } // namespace slang::ast

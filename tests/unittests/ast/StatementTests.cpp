@@ -3,6 +3,8 @@
 
 #include "Test.h"
 
+#include "slang/ast/statements/ConditionalStatements.h"
+#include "slang/ast/statements/MiscStatements.h"
 #include "slang/ast/symbols/BlockSymbols.h"
 #include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
@@ -282,7 +284,7 @@ module m;
     int unpacked [3];
 
     always begin : block
-        case (foo)
+        case (9'(foo))
             3'd7 + 3'd7: ;
             default;
             9'd9, 9'd8: ;
@@ -305,6 +307,7 @@ module m;
 
         case (null)
             null: ;
+            default;
         endcase
 
         case ("asdf")
@@ -315,7 +318,7 @@ module m;
         endcase
 
         casex (foo)
-            1'bx: ;
+            1'b0: ;
             1'd1: ;
             default;
         endcase
@@ -1277,6 +1280,7 @@ module m;
         @cb i++;
         @(cb) i++;
         @(cb or posedge cb) i++;
+        @(cb iff i > 0) i++;
         @(cb.clk) i++;
     end
 endmodule
@@ -1286,8 +1290,9 @@ endmodule
     compilation.addSyntaxTree(tree);
 
     auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 1);
+    REQUIRE(diags.size() == 2);
     CHECK(diags[0].code == diag::ClockingBlockEventEdge);
+    CHECK(diags[1].code == diag::ClockingBlockEventIff);
 }
 
 TEST_CASE("Cycle delay errors") {
@@ -1309,6 +1314,27 @@ endmodule
     REQUIRE(diags.size() == 2);
     CHECK(diags[0].code == diag::ExprMustBeIntegral);
     CHECK(diags[1].code == diag::NoDefaultClocking);
+}
+
+TEST_CASE("Cycle delay in interface") {
+    auto tree = SyntaxTree::fromText(R"(
+interface intf(
+    input clk
+);
+
+    default clocking cb @(posedge clk);
+    endclocking
+
+    task zeroDelay();
+        ##0;
+    endtask
+
+endinterface
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
 }
 
 TEST_CASE("Synchronous drives") {
@@ -1350,15 +1376,14 @@ endmodule
     compilation.addSyntaxTree(tree);
 
     auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 8);
+    REQUIRE(diags.size() == 7);
     CHECK(diags[0].code == diag::WriteToInputClockVar);
     CHECK(diags[1].code == diag::ClockVarSyncDrive);
     CHECK(diags[2].code == diag::ClockVarBadTiming);
     CHECK(diags[3].code == diag::CycleDelayNonClock);
     CHECK(diags[4].code == diag::ClockVarAssignConcat);
-    CHECK(diags[5].code == diag::ClockVarTargetAssign);
-    CHECK(diags[6].code == diag::ClockVarSyncDrive);
-    CHECK(diags[7].code == diag::ClockVarOutputRead);
+    CHECK(diags[5].code == diag::ClockVarSyncDrive);
+    CHECK(diags[6].code == diag::ClockVarOutputRead);
 }
 
 TEST_CASE("Invalid case statement regress GH #422") {
@@ -1562,91 +1587,6 @@ endmodule
     NO_COMPILATION_ERRORS;
 }
 
-TEST_CASE("Unrollable for loop drivers") {
-    auto tree = SyntaxTree::fromText(R"(
- module m;
-    int foo[10];
-    initial
-        for (int i = 1; i < 10; i += 2) begin : baz
-            foo[i] = 2;
-        end
-
-    for (genvar i = 0; i < 10; i += 2) begin
-        always_comb foo[i] = 1;
-    end
-
-    always_comb foo[1] = 1; // error
-
-    struct { int foo; int bar; } baz[3][2];
-    initial begin
-        while (1) begin
-            for (int i = 0; i < 3; i++) begin
-                for (int j = 0; j < 2; j++) begin
-                    forever begin
-                        if (i != 2 || j != 1)
-                            #1 baz[i][j].foo = 1;
-                    end
-                end
-            end
-        end
-    end
-    for (genvar i = 0; i < 3; i++) begin
-        always_comb baz[i][0].bar = 3;
-    end
-
-    always_comb baz[1][1].foo = 4; // error
-    always_comb baz[1][1].bar = 4;
-    always_comb baz[2][1].foo = 3;
-
-    struct { int foo; int bar; } arr[21474836];
-    initial begin
-        for (int i = 0; i < 2147483647; i++) begin
-            arr[i].foo = 1;
-        end
-    end
-    always_comb arr[0].bar = 2;
- endmodule
-)");
-
-    CompilationOptions options;
-    options.maxConstexprSteps = 10000;
-
-    Compilation compilation(options);
-    compilation.addSyntaxTree(tree);
-
-    auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 3);
-    CHECK(diags[0].code == diag::MultipleAlwaysAssigns);
-    CHECK(diags[1].code == diag::MultipleAlwaysAssigns);
-    CHECK(diags[2].code == diag::MultipleAlwaysAssigns);
-}
-
-TEST_CASE("Unrollable for loop drivers -- strict checking") {
-    auto tree = SyntaxTree::fromText(R"(
-module m;
-    int foo[10];
-    initial
-        for (int i = 1; i < 10; i += 2) begin : baz
-            foo[i] = 2;
-        end
-
-    for (genvar i = 0; i < 10; i += 2) begin
-        always_comb foo[i] = 1;
-    end
-endmodule
-)");
-
-    CompilationOptions options;
-    options.flags |= CompilationFlags::StrictDriverChecking;
-
-    Compilation compilation(options);
-    compilation.addSyntaxTree(tree);
-
-    auto& diags = compilation.getAllDiagnostics();
-    REQUIRE(diags.size() == 1);
-    CHECK(diags[0].code == diag::MultipleAlwaysAssigns);
-}
-
 TEST_CASE("foreach shadowed variable regression") {
     auto tree = SyntaxTree::fromText(R"(
 class C #(parameter type foo_t);
@@ -1748,7 +1688,7 @@ module m;
     end
 
     initial begin
-        e = instr matches tagged Jmp tagged JmpC '{cc:.c,addr:.a} &&& foo > 1 ? a + 10'(c) : 0;
+        e = instr matches tagged Jmp tagged JmpC '{cc:.c,addr:.a} &&& foo > 1 ? 32'(a + 10'(c)) : 0;
     end
 endmodule
 )");
@@ -2005,4 +1945,77 @@ endfunction
     auto& diags = compilation.getAllDiagnostics();
     REQUIRE(diags.size() == 1);
     CHECK(diags[0].code == diag::RefArgForkJoin);
+}
+
+TEST_CASE("Pattern variable lookup from nested initializers") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    int i;
+    initial begin
+        if (i matches .a) begin
+            begin
+                automatic int b = a;
+            end
+        end
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    NO_COMPILATION_ERRORS;
+}
+
+TEST_CASE("Procedural checker statement restrictions") {
+    auto tree = SyntaxTree::fromText(R"(
+module m;
+    checker c;
+    endchecker
+
+    function foo;
+        c c1();
+    endfunction
+
+    initial begin
+        fork
+            c c1();
+        join
+    end
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 2);
+    CHECK(diags[0].code == diag::CheckerNotInProc);
+    CHECK(diags[1].code == diag::CheckerInForkJoin);
+}
+
+TEST_CASE("Conditional statement with pattern and explicit block crash regress") {
+    auto tree = SyntaxTree::fromText(R"(
+always begin union instr:if(instr matches begin c T i:
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+    compilation.getAllDiagnostics();
+}
+
+TEST_CASE("Concurrent assertions not allowed in tasks") {
+    auto tree = SyntaxTree::fromText(R"(
+module m(input clk, a);
+    task t;
+        assert property (@(posedge clk) a == 1);
+    endtask
+endmodule
+)");
+
+    Compilation compilation;
+    compilation.addSyntaxTree(tree);
+
+    auto& diags = compilation.getAllDiagnostics();
+    REQUIRE(diags.size() == 1);
+    CHECK(diags[0].code == diag::ConcurrentAssertNotInProc);
 }

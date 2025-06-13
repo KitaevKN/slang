@@ -35,11 +35,7 @@ public:
     ConstantValue evalImpl(EvalContext& context) const;
     LValue evalLValueImpl(EvalContext& context) const;
     bool requireLValueImpl(const ASTContext& context, SourceLocation location,
-                           bitmask<AssignFlags> flags, const Expression* longestStaticPrefix) const;
-
-    void getLongestStaticPrefixesImpl(
-        SmallVector<std::pair<const ValueSymbol*, const Expression*>>& results,
-        EvalContext& evalContext, const Expression* longestStaticPrefix) const;
+                           bitmask<AssignFlags> flags) const;
 
     std::optional<ConstantRange> evalIndex(EvalContext& context, const ConstantValue& val,
                                            ConstantValue& associativeIndex, bool& softFail) const;
@@ -97,13 +93,10 @@ public:
     ConstantValue evalImpl(EvalContext& context) const;
     LValue evalLValueImpl(EvalContext& context) const;
     bool requireLValueImpl(const ASTContext& context, SourceLocation location,
-                           bitmask<AssignFlags> flags, const Expression* longestStaticPrefix) const;
+                           bitmask<AssignFlags> flags) const;
 
-    void getLongestStaticPrefixesImpl(
-        SmallVector<std::pair<const ValueSymbol*, const Expression*>>& results,
-        EvalContext& evalContext, const Expression* longestStaticPrefix) const;
-
-    std::optional<ConstantRange> evalRange(EvalContext& context, const ConstantValue& val) const;
+    std::optional<ConstantRange> evalRange(EvalContext& context, const ConstantValue& val,
+                                           bool enforceBounds) const;
 
     void serializeTo(ASTSerializer& serializer) const;
 
@@ -151,11 +144,7 @@ public:
     ConstantValue evalImpl(EvalContext& context) const;
     LValue evalLValueImpl(EvalContext& context) const;
     bool requireLValueImpl(const ASTContext& context, SourceLocation location,
-                           bitmask<AssignFlags> flags, const Expression* longestStaticPrefix) const;
-
-    void getLongestStaticPrefixesImpl(
-        SmallVector<std::pair<const ValueSymbol*, const Expression*>>& results,
-        EvalContext& evalContext, const Expression* longestStaticPrefix) const;
+                           bitmask<AssignFlags> flags) const;
 
     void serializeTo(ASTSerializer& serializer) const;
 

@@ -7,11 +7,11 @@
 //------------------------------------------------------------------------------
 #include "slang/ast/expressions/CallExpression.h"
 
-#include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/Constraints.h"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/SystemSubroutine.h"
+#include "slang/ast/expressions/AssignmentExpressions.h"
 #include "slang/ast/expressions/MiscExpressions.h"
 #include "slang/ast/expressions/SelectExpressions.h"
 #include "slang/ast/symbols/ClassSymbols.h"
@@ -201,37 +201,13 @@ bool CallExpression::bindArgs(const ArgumentListSyntax* argSyntax,
                               std::span<const FormalArgumentSymbol* const> formalArgs,
                               std::string_view symbolName, SourceRange range,
                               const ASTContext& context,
-                              SmallVectorBase<const Expression*>& boundArgs, bool isBuiltInMethod) {
+                              SmallVectorBase<const Expression*>& boundArgs) {
     SmallVector<const SyntaxNode*> orderedArgs;
     NamedArgMap namedArgs;
     if (argSyntax) {
         if (!collectArgs(context, *argSyntax, orderedArgs, namedArgs))
             return false;
     }
-
-    // Helper function to register a driver for default value arguments.
-    auto addDefaultDriver = [&](const Expression& expr, const FormalArgumentSymbol& formal) {
-        if (isBuiltInMethod)
-            return;
-
-        switch (formal.direction) {
-            case ArgumentDirection::In:
-                // Nothing to do for inputs.
-                break;
-            case ArgumentDirection::Out:
-            case ArgumentDirection::InOut:
-                // The default value binding should always use bindLValue() which
-                // will always return either an AssignmentExpression or a bad expr.
-                SLANG_ASSERT(expr.kind == ExpressionKind::Assignment || expr.bad());
-                if (expr.kind == ExpressionKind::Assignment)
-                    expr.as<AssignmentExpression>().left().requireLValue(context);
-                break;
-            case ArgumentDirection::Ref:
-                if (!formal.flags.has(VariableFlags::Const))
-                    expr.requireLValue(context);
-                break;
-        }
-    };
 
     bool bad = false;
     uint32_t orderedIndex = 0;
@@ -244,8 +220,6 @@ bool CallExpression::bindArgs(const ArgumentListSyntax* argSyntax,
                 expr = formal->getDefaultValue();
                 if (!expr)
                     context.addDiag(diag::ArgCannotBeEmpty, arg->sourceRange()) << formal->name;
-                else
-                    addDefaultDriver(*expr, *formal);
             }
             else if (auto exSyn = context.requireSimpleExpr(arg->as<PropertyExprSyntax>())) {
                 expr = &Expression::bindArgument(formal->getType(), formal->direction,
@@ -275,9 +249,6 @@ bool CallExpression::bindArgs(const ArgumentListSyntax* argSyntax,
                     context.addDiag(diag::ArgCannotBeEmpty, it->second.first->sourceRange())
                         << formal->name;
                 }
-                else {
-                    addDefaultDriver(*expr, *formal);
-                }
             }
             else if (auto exSyn = context.requireSimpleExpr(*arg)) {
                 expr = &Expression::bindArgument(formal->getType(), formal->direction,
@@ -297,9 +268,6 @@ bool CallExpression::bindArgs(const ArgumentListSyntax* argSyntax,
                 else {
                     context.addDiag(diag::UnconnectedArg, range) << formal->name;
                 }
-            }
-            else {
-                addDefaultDriver(*expr, *formal);
             }
         }
 
@@ -335,17 +303,13 @@ bool CallExpression::bindArgs(const ArgumentListSyntax* argSyntax,
     return !bad;
 }
 
-static void addSubroutineDrivers(const Symbol& procedure, const SubroutineSymbol& sub,
-                                 const Expression& callExpr);
-
 Expression& CallExpression::fromArgs(Compilation& compilation, const Subroutine& subroutine,
                                      const Expression* thisClass,
                                      const ArgumentListSyntax* argSyntax, SourceRange range,
                                      const ASTContext& context) {
     SmallVector<const Expression*> boundArgs;
     const SubroutineSymbol& symbol = *std::get<0>(subroutine);
-    bool bad = !bindArgs(argSyntax, symbol.getArguments(), symbol.name, range, context, boundArgs,
-                         symbol.flags.has(MethodFlags::BuiltIn));
+    bool bad = !bindArgs(argSyntax, symbol.getArguments(), symbol.name, range, context, boundArgs);
 
     auto result = compilation.emplace<CallExpression>(&symbol, symbol.getReturnType(), thisClass,
                                                       boundArgs.copy(compilation),
@@ -369,13 +333,6 @@ Expression& CallExpression::fromArgs(Compilation& compilation, const Subroutine&
 
     if (!checkOutputArgs(context, symbol.hasOutputArgs(), range))
         return badExpr(compilation, result);
-
-    // If this subroutine is invoked from a procedure, register drivers for this
-    // particular procedure to detect multiple driver violations.
-    if (!thisClass && symbol.subroutineKind == SubroutineKind::Function) {
-        if (auto proc = context.getProceduralBlock(); proc && !context.scope->isUninstantiated())
-            addSubroutineDrivers(*proc, symbol, *result);
-    }
 
     return *result;
 }
@@ -775,6 +732,15 @@ std::optional<bitwidth_t> CallExpression::getEffectiveWidthImpl() const {
     return type->getBitWidth();
 }
 
+Expression::EffectiveSign CallExpression::getEffectiveSignImpl(bool) const {
+    if (isSystemCall()) {
+        auto& callInfo = std::get<1>(subroutine);
+        if (callInfo.subroutine->getEffectiveWidth() == 1)
+            return EffectiveSign::Either;
+    }
+    return type->isSigned() ? EffectiveSign::Signed : EffectiveSign::Unsigned;
+}
+
 bool CallExpression::checkConstant(EvalContext& context, const SubroutineSymbol& subroutine,
                                    SourceRange range) {
     if (context.flags.has(EvalFlags::IsScript))
@@ -851,6 +817,14 @@ SubroutineKind CallExpression::getSubroutineKind() const {
     return symbol.subroutineKind;
 }
 
+parsing::KnownSystemName CallExpression::getKnownSystemName() const {
+    if (subroutine.index() == 1) {
+        auto& callInfo = std::get<1>(subroutine);
+        return callInfo.subroutine->knownNameId;
+    }
+    return parsing::KnownSystemName::Unknown;
+}
+
 bool CallExpression::hasOutputArgs() const {
     if (subroutine.index() == 1) {
         auto& callInfo = std::get<1>(subroutine);
@@ -900,74 +874,6 @@ void CallExpression::serializeTo(ASTSerializer& serializer) const {
             serializer.serialize(*arg);
         serializer.endArray();
     }
-}
-
-class DriverVisitor : public ASTVisitor<DriverVisitor, true, true> {
-public:
-    const Symbol& procedure;
-    const SubroutineSymbol& sub;
-    const Expression& callExpr;
-    SmallSet<const ValueSymbol*, 8> visitedValues;
-    SmallSet<const SubroutineSymbol*, 4>& visitedSubs;
-
-    DriverVisitor(const Symbol& procedure, SmallSet<const SubroutineSymbol*, 4>& visitedSubs,
-                  const SubroutineSymbol& sub, const Expression& callExpr) :
-        procedure(procedure), sub(sub), callExpr(callExpr), visitedSubs(visitedSubs) {}
-
-    void handle(const CallExpression& expr) {
-        if (!expr.isSystemCall() && !expr.thisClass()) {
-            auto& subroutine = *std::get<0>(expr.subroutine);
-            if (subroutine.subroutineKind == SubroutineKind::Function &&
-                visitedSubs.emplace(&subroutine).second) {
-
-                DriverVisitor visitor(procedure, visitedSubs, subroutine, callExpr);
-                subroutine.getBody().visit(visitor);
-            }
-        }
-    }
-
-    void handle(const ValueExpressionBase& expr) {
-        auto& sym = expr.symbol;
-        if (!visitedValues.emplace(&sym).second)
-            return;
-
-        if (sub.getCompilation().hasFlag(CompilationFlags::AllowMultiDrivenLocals)) {
-            auto scope = sym.getParentScope();
-            while (scope && scope->asSymbol().kind == SymbolKind::StatementBlock)
-                scope = scope->asSymbol().getParentScope();
-
-            if (scope == &sub) {
-                // This is a local variable of the subroutine,
-                // so don't do driver checking.
-                return;
-            }
-        }
-
-        // If the target symbol is driven by the subroutine we're inspecting,
-        // add another driver for the procedure we're originally called from.
-        SmallVector<std::pair<DriverBitRange, const ValueDriver*>> drivers;
-        auto range = sym.drivers();
-        for (auto it = range.begin(); it != range.end(); ++it) {
-            if ((*it)->containingSymbol == &sub)
-                drivers.push_back({it.bounds(), *it});
-        }
-
-        // This needs to be a separate loop to avoid mutating the driver map
-        // while iterating over it.
-        for (auto [bounds, driver] : drivers) {
-            sym.addDriver(DriverKind::Procedural, bounds, *driver->prefixExpression, procedure,
-                          callExpr);
-        }
-    }
-};
-
-static void addSubroutineDrivers(const Symbol& procedure, const SubroutineSymbol& sub,
-                                 const Expression& callExpr) {
-    SmallSet<const SubroutineSymbol*, 4> visitedSubs;
-    visitedSubs.emplace(&sub);
-
-    DriverVisitor visitor(procedure, visitedSubs, sub, callExpr);
-    sub.getBody().visit(visitor);
 }
 
 } // namespace slang::ast

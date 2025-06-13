@@ -7,6 +7,11 @@
 //------------------------------------------------------------------------------
 #pragma once
 
+#include "Netlist.h"
+
+#include "slang/ast/ASTVisitor.h"
+#include "slang/ast/LSPUtilities.h"
+
 using namespace slang;
 
 namespace netlist {
@@ -19,7 +24,7 @@ public:
                                       bool leftOperand = false) :
         netlist(netlist), evalCtx(evalCtx), leftOperand(leftOperand) {}
 
-    void handle(const ast::NamedValueExpression& expr) {
+    void handle(const ast::ValueExpressionBase& expr) {
 
         // If the symbol reference is to a constant (eg a parameter or enum
         // value), then skip it.
@@ -54,11 +59,18 @@ public:
         if (!selectors.empty()) {
             SmallVector<std::pair<const slang::ast::ValueSymbol*, const slang::ast::Expression*>>
                 prefixes;
-            selectors.front()->getLongestStaticPrefixes(prefixes, evalCtx);
+
+            slang::ast::LSPUtilities::visitLSPs(*selectors.front(), evalCtx,
+                                                [&](const slang::ast::ValueSymbol& symbol,
+                                                    const slang::ast::Expression& lsp,
+                                                    bool isLValue) {
+                                                    if (isLValue)
+                                                        prefixes.emplace_back(&symbol, &lsp);
+                                                });
             SLANG_ASSERT(prefixes.size() == 1);
             auto [prefixSymbol, prefixExpr] = prefixes.back();
-            auto bounds = slang::ast::ValueDriver::getBounds(*prefixExpr, evalCtx,
-                                                             prefixSymbol->getType());
+            auto bounds = slang::ast::LSPUtilities::getBounds(*prefixExpr, evalCtx,
+                                                              prefixSymbol->getType());
             node.bounds = {static_cast<int32_t>(bounds->first),
                            static_cast<int32_t>(bounds->second)};
         }
